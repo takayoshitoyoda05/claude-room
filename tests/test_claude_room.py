@@ -528,6 +528,38 @@ class StorageTests(unittest.TestCase):
             cr.MAX_LOG_BYTES = old
 
 
+class PublicModeTests(unittest.TestCase):
+    """--public のとき: 中継（tailscaled）が入れる X-Forwarded-For を、本当の送信元として扱う。"""
+
+    def _server(self, trust):
+        d = Path(tempfile.mkdtemp(dir=_TMP))
+        room = cr.Room("p", d / "log.jsonl", 0)
+        srv = cr.HardenedServer(("127.0.0.1", 0), cr.make_handler(room, "k" * 30, cr.Invites(d / "i.json"), trust))
+        threading.Thread(target=srv.serve_forever, daemon=True).start()
+        self.addCleanup(lambda: (srv.shutdown(), srv.server_close()))
+        return f"http://127.0.0.1:{srv.server_address[1]}"
+
+    def test_lockout_is_per_real_source(self):
+        base = self._server(True)
+        bad = lambda ip: call(base, "/api/messages", "wrong", headers={"X-Forwarded-For": ip})[0]
+        codes = [bad("203.0.113.5") for _ in range(cr.FAIL_LIMIT + 2)]
+        self.assertEqual(codes[-1], 429)                       # 攻撃している送信元は締め出される
+        self.assertEqual(bad("198.51.100.7"), 401)             # 別の送信元は巻き込まれない
+
+    def test_forwarded_header_ignored_when_not_public(self):
+        base = self._server(False)
+        codes = [call(base, "/api/messages", "wrong", headers={"X-Forwarded-For": f"10.0.0.{i}"})[0]
+                 for i in range(cr.FAIL_LIMIT + 2)]
+        self.assertEqual(codes[-1], 429)                       # ヘッダーを変えても、締め出しを逃れられない
+
+    def test_anonymous_page_rate_limit(self):
+        base = self._server(True)
+        get = lambda ip: call(base, "/api/ping", headers={"X-Forwarded-For": ip})[0]
+        codes = [get("203.0.113.9") for _ in range(cr.ANON_RATE + 1)]
+        self.assertEqual(codes[-1], 429)
+        self.assertEqual(get("198.51.100.8"), 200)
+
+
 class FakeHost:
     """悪意のあるホストのふり。決めた JSON を返す。"""
 

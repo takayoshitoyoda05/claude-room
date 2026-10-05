@@ -70,6 +70,7 @@ MAX_ERROR_BODY = 64 * 1024                                 # エラーの応答�
 MAX_PAGES = 20                                             # 1 回にまとめて読む「続き」のページ数
 PAGE_CHARS = 2_000_000                                     # 1 回に返す発言の本文の合計（文字数）の上限
 OPS_RATE = 120                                             # 1 人あたり、1 分に読み取り・発言権・状態の要求をできる回数
+ANON_RATE = 60                                             # 鍵なしの要求（画面の取得など）を、1 つの送信元が 1 分にできる回数
 GUEST_STREAMS = 4                                          # 招待された人 1 人あたりの待ち受けの本数
 GUEST_STREAMS_TOTAL = 24                                   # 招待された人全体の待ち受けの本数（残りはホスト用）
 FLOOR_UNREACHABLE = 120                                    # 承認待ちで、発言権を確かめられないまま待つ上限（秒）
@@ -482,7 +483,7 @@ class HardenedServer(ThreadingHTTPServer):
             now = time.time()
             k = (kind, who)
             recent = [t for t in self._posts.get(k, []) if now - t < 60]
-            ok = len(recent) < (POST_RATE if kind == "post" else OPS_RATE)
+            ok = len(recent) < {"post": POST_RATE, "anon": ANON_RATE}.get(kind, OPS_RATE)
             if ok:
                 recent.append(now)
             self._posts[k] = recent
@@ -606,7 +607,7 @@ def guest_names(name):
     return {name} | {f"{p}-{name}" for p in AI_KINDS}
 
 
-def make_handler(room, key, invites):
+def make_handler(room, key, invites, trust_forwarded=False):
     class Handler(BaseHTTPRequestHandler):
         server_version = "claude-room"
         sys_version = ""
@@ -643,13 +644,27 @@ def make_handler(room, key, invites):
             if inv:
                 self.who = {"role": "guest", "name": inv["name"], "id": inv["id"]}
                 return True
-            ip = self.client_address[0]
+            ip = self._source()
             if self.server.too_many_fails(ip):
                 self._json(429, {"error": "too many attempts"})
             else:
                 self.server.record_fail(ip)
                 self._json(401, {"error": "bad key"})
             return False
+
+        def _source(self):
+            """要求の本当の送信元。
+
+            --public（Tailscale Funnel）のときは、中継する tailscaled が X-Forwarded-For に本当の送信元を入れる
+            （利用者が付けた同名のヘッダーは上書きされる。Tailscale のソースと実験で確認）。
+            信頼するのは、公開モードで、かつ中継（127.0.0.1）から来た要求のときだけ。
+            """
+            peer = self.client_address[0]
+            if trust_forwarded and peer == "127.0.0.1":
+                fwd = (self.headers.get("X-Forwarded-For") or "").split(",")[0].strip()
+                if fwd and len(fwd) <= 64:
+                    return fwd
+            return peer
 
         def _may_act_as(self, name):
             """招待された人は、自分と自分の AI の名前でしか、発言・操作できない（なりすまし防止）。"""
@@ -680,6 +695,8 @@ def make_handler(room, key, invites):
         def _get(self):
             u = urlparse(self.path)
             qs = parse_qs(u.query)
+            if u.path in ("/", "/api/ping") and not self.server.rate_ok(self._source(), "anon"):
+                return self._json(429, {"error": "要求が多すぎます。少し待ってください"})
             if u.path == "/":
                 nonce = secrets.token_urlsafe(12)
                 return self._send(200, PAGE.replace("__REPO_URL__", REPO_URL).replace("__NONCE__", nonce).encode(),
@@ -886,11 +903,11 @@ def make_handler(room, key, invites):
     return Handler
 
 
-def serve(room, key, invites, binds, port):
+def serve(room, key, invites, binds, port, trust_forwarded=False):
     servers = []
     for host in binds:
         try:
-            srv = HardenedServer((host, port), make_handler(room, key, invites))
+            srv = HardenedServer((host, port), make_handler(room, key, invites, trust_forwarded))
         except OSError as e:
             log(f"[警告] {host}:{port} で待ち受けできません: {e}")
             continue
@@ -2059,7 +2076,7 @@ def cmd_host(a):
     invites.reserved = {a.name}                                # ホストの名前は、どの経路でも招待に使えない
     if a.public:
         # 公開するときは 127.0.0.1 だけで待ち受け、Funnel 経由でだけ外から届くようにする
-        up = serve(room, key, invites, ["127.0.0.1"], a.port)
+        up = serve(room, key, invites, ["127.0.0.1"], a.port, trust_forwarded=True)
         room.invite_bases = [start_funnel(a.port, a.public_port)]
         public = room.invite_bases
     else:
