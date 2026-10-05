@@ -226,29 +226,76 @@ class ServerTests(unittest.TestCase):
             self.fail("取り消しても、受信が切れない")
         s.close()
 
-    def _race(self, path, body_for):
-        """要求がロックの手前で待っている間に招待を取り消しても、受け付けないこと。"""
+    def _race(self, method_path, body_for, spy_on="is_active"):
+        """要求が「鍵の確認」を通ってロックの手前で待っている間に、招待を取り消す。
+
+        待ち時間に頼らず、合図で同期する: spy_on の関数（is_active＝ロックの外での事前確認、
+        find＝鍵の確認）が呼ばれたことを確かめてから取り消すので、必ず「ロックの中での確認」が試される。
+        """
         name = "r" + secrets_hex()
         _, key = self.invites.create(name)
+        inv_id = self.invites.find(key)["id"]
+        passed, calls = threading.Event(), []
+        real = getattr(self.invites, spy_on)
+
+        def spy(arg):
+            res = real(arg)
+            if (spy_on == "find" and res) or (spy_on == "is_active" and arg == inv_id):
+                calls.append(res)
+                passed.set()
+            return res
+        setattr(self.invites, spy_on, spy)
         result = {}
         self.room.cond.acquire()
         try:
-            t = threading.Thread(target=lambda: result.update(code=call(self.base, path, key, body_for(name))[0]))
+            path, body = method_path, body_for(name)
+            t = threading.Thread(target=lambda: result.update(code=call(self.base, path, key, body)[0]))
             t.start()
-            time.sleep(0.7)                   # 鍵の確認を通り、ロックの手前で待っている
+            self.assertTrue(passed.wait(10), "要求が鍵の確認を通らなかった")
             self.invites.revoke(name)
         finally:
             self.room.cond.release()
-        t.join(10)
-        return result.get("code")
+            t.join(10)
+            setattr(self.invites, spy_on, real)
+        return result.get("code"), name
 
     def test_revoke_race_all_actions(self):
-        self.assertEqual(self._race("/api/send", lambda n: {"name": n, "text": "late"}), 401)
-        self.assertEqual(self._race("/api/floor", lambda n: {"name": "claude-" + n, "action": "claim"}), 401)
-        self.assertEqual(self._race("/api/control", lambda n: {"by": n, "paused": True}), 401)
-        self.assertEqual(self._race("/api/status", lambda n: {"name": "claude-" + n, "status": "idle"}), 401)
+        self.assertEqual(self._race("/api/send", lambda n: {"name": n, "text": "late"})[0], 401)
+        self.assertEqual(self._race("/api/floor", lambda n: {"name": "claude-" + n, "action": "claim"})[0], 401)
+        self.assertEqual(self._race("/api/control", lambda n: {"by": n, "paused": True})[0], 401)
+        self.assertEqual(self._race("/api/status", lambda n: {"name": "claude-" + n, "status": "idle"})[0], 401)
         self.assertIsNone(self.room.floor)
         self.assertFalse(self.room.paused)
+        self.assertFalse(any(m["text"] == "late" for m in self.room.messages))
+
+    def test_revoke_race_heartbeat(self):
+        # 生存の合図（/api/wait）は事前確認がないので、鍵の確認（find）を合図にする
+        name = "r" + secrets_hex()
+        _, key = self.invites.create(name)
+        passed = threading.Event()
+        real = self.invites.find
+
+        def spy(k):
+            res = real(k)
+            if res:
+                passed.set()
+            return res
+        self.invites.find = spy
+        result = {}
+        q = f"/api/wait?timeout=0&v=-2&after=0&agent=claude&owner={name}&name=claude-{name}"
+        self.room.cond.acquire()
+        try:
+            t = threading.Thread(target=lambda: result.update(code=call(self.base, q, key)[0]))
+            t.start()
+            self.assertTrue(passed.wait(10))
+            self.invites.revoke(name)
+        finally:
+            self.room.cond.release()
+            t.join(10)
+            self.invites.find = real
+        self.assertEqual(result.get("code"), 401)
+        self.assertNotIn(f"claude-{name}", self.room.agents)          # 外した AI が再登録されない
+        self.assertFalse(any(f"claude-{name}" in m["text"] for m in self.room.messages))
 
     def test_messages_after_revoke(self):
         bob_id = self.invites.find(self.bob)["id"]
@@ -264,6 +311,16 @@ class ServerTests(unittest.TestCase):
                  for _ in range(cr.POST_RATE)]
         self.assertIn(429, codes)
 
+    def test_control_is_all_or_nothing(self):
+        before = len(self.room.messages)
+        code = call(self.base, "/api/control", self.bob, {"by": "bob", "paused": True, "max_turns": "invalid"})[0]
+        self.assertEqual(code, 400)
+        self.assertFalse(self.room.paused)                         # 一部だけ反映されない
+        self.assertEqual(len(self.room.messages), before)
+        self.assertEqual(call(self.base, "/api/control", self.key, {"by": "alice", "max_turns": 10 ** 6})[0], 400)
+        call(self.base, "/api/control", self.key, {"by": "alice", "max_turns": 5})
+        self.assertEqual(call(self.base, "/api/control", self.key, {"by": "alice", "add_turns": 10 ** 6})[0], 400)
+
     def test_cid_is_per_sender(self):
         a = call(self.base, "/api/send", self.bob, {"name": "bob", "text": "from bob", "cid": "same"})
         b = call(self.base, "/api/send", self.carol, {"name": "carol", "text": "from carol", "cid": "same"})
@@ -271,6 +328,9 @@ class ServerTests(unittest.TestCase):
         self.assertNotEqual(a[1]["seq"], b[1]["seq"])             # 別の人の同じ ID で、投稿が消えない
         c = call(self.base, "/api/send", self.bob, {"name": "bob", "text": "changed", "cid": "same"})
         self.assertEqual(c[0], 409)                               # 同じ人の同じ ID で、中身が違う
+        call(self.base, "/api/floor", self.bob, {"name": "claude-bob", "action": "claim"})
+        d = call(self.base, "/api/send", self.bob, {"name": "claude-bob", "kind": "claude", "text": "ai", "cid": "same"})
+        self.assertEqual(d[0], 200)                               # 同じ招待でも、AI の名前なら別の ID の扱い
 
     def test_pagination_does_not_drop(self):
         for i in range(1200):
@@ -303,6 +363,30 @@ class ServerTests(unittest.TestCase):
         self.assertIn("frame-ancestors 'none'", csp)
         self.assertIsNone(re.search(r'\son[a-z]+="', body))       # インラインのイベント処理がない
         self.assertNotIn("Python", urllib.request.urlopen(self.base + "/").headers["Server"])
+
+
+class StorageTests(unittest.TestCase):
+    def test_rooms_do_not_collide(self):
+        a = cr.room_paths("private")[1]
+        b = cr.room_paths("private.old")[1]
+        self.assertNotEqual(cr.old_path(a), b)
+        self.assertNotEqual(a.parent, b.parent)
+
+    def test_rotation_keeps_history_on_restart(self):
+        d = Path(tempfile.mkdtemp(dir=_TMP))
+        old = cr.MAX_LOG_BYTES
+        cr.MAX_LOG_BYTES = 300
+        try:
+            room = cr.Room("r", d / "log.jsonl", 0)
+            for i in range(20):
+                room.post("alice", "human", f"m{i}")
+            self.assertTrue(cr.old_path(d / "log.jsonl").exists())
+            again = cr.Room("r", d / "log.jsonl", 0)
+            texts = [m["text"] for m in again.messages]
+            self.assertIn("m19", texts)
+            self.assertGreater(len(texts), 5)                      # 切り替えの直前の会話も戻る
+        finally:
+            cr.MAX_LOG_BYTES = old
 
 
 class FakeHost:
@@ -356,6 +440,36 @@ class MaliciousHostTests(unittest.TestCase):
         self.assertEqual(st["version"], -1)
         self.assertFalse(st["paused"])
         self.assertEqual(st["agents"], [{"name": "claude-bob", "muted": False}])
+
+    def _stub_agent(self, responses):
+        ag = object.__new__(cr.Agent)
+        ag.history, ag.v, ag.room = [], -1, "room"
+        it = iter(responses)
+        ag.api = lambda *a, **k: next(it)
+        return ag
+
+    def test_more_without_progress_stops(self):
+        bad = {"messages": [], "state": {}, "more": True}
+        ag = self._stub_agent([bad] * 1000)
+        st = ag._read_more(bad, ag._absorb(bad))                   # 空の「続きあり」でも、落ちずに打ち切る
+        self.assertEqual(st["room"], "room")
+
+    def test_huge_timestamp(self):
+        m = cr.Agent._clean_msg({"seq": 1, "ts": 10 ** 400, "name": "bob", "kind": "human", "text": "x"})
+        self.assertEqual(m["ts"], 0.0)
+
+    def test_response_size_limit(self):
+        host = FakeHost({"/big": {"messages": ["x" * 2000]}})
+        old = cr.MAX_RESPONSE
+        cr.MAX_RESPONSE = 1000
+        try:
+            ag = object.__new__(cr.Agent)
+            ag.base, ag.key = host.base, "k"
+            with self.assertRaises(ValueError):
+                ag.api("GET", "/big")
+        finally:
+            cr.MAX_RESPONSE = old
+            host.close()
 
     def test_clean_state_bad_shapes(self):
         self.assertEqual(cr.Agent._clean_state({"agents": 1})["agents"], [])
@@ -446,6 +560,27 @@ class ProcessTests(unittest.TestCase):
         ag._halted_now = boom
         with self.assertRaises(RuntimeError):
             self._run(ag)
+
+    @unittest.skipUnless(POSIX, "プロセスグループは POSIX")
+    def test_grandchild_is_killed(self):
+        pidfile = Path(tempfile.mkdtemp(dir=_TMP)) / "pid"
+        code = ("import subprocess, sys, time; "
+                f"p = subprocess.Popen([sys.executable, '-c', 'import time; time.sleep(60)']); "
+                f"open({str(pidfile)!r}, 'w').write(str(p.pid)); time.sleep(0.3)")
+        ag = self._agent()
+        start = time.time()
+        ag._halted_now = lambda: time.time() - start > 1.5
+        with self.assertRaises(cr.Stopped):
+            ag._run_process([sys.executable, "-c", code], "")
+        pid = int(pidfile.read_text())
+        time.sleep(0.5)
+        try:
+            os.kill(pid, 0)
+            with open(f"/proc/{pid}/stat") as f:          # ゾンビなら、止まっている
+                alive = f.read().split()[2] != "Z"
+        except (ProcessLookupError, FileNotFoundError):
+            alive = False
+        self.assertFalse(alive, "孫のプロセスが残っている")
 
     def test_child_is_killed_when_stopped(self):
         ag = self._agent()
