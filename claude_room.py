@@ -61,6 +61,9 @@ POST_RATE = 30                                             # 1 人（招待）�
 MAX_LOG_BYTES = 50 * 1024 * 1024                           # ログがこの大きさを超えたら、古いログに切り替える
 MAX_RESPONSE = 48 * 1024 * 1024                            # 参加者が受け取るホストの応答の上限（バイト）
 MAX_TURNS_LIMIT = 1000                                     # AI の連続発言の上限に指定できる最大値
+MAX_ERROR_BODY = 64 * 1024                                 # エラーの応答として読む上限（バイト）
+MAX_PAGES = 20                                             # 1 回にまとめて読む「続き」のページ数
+FLOOR_UNREACHABLE = 120                                    # 承認待ちで、発言権を確かめられないまま待つ上限（秒）
 STATUSES = {"idle", "thinking", "checking", "awaiting"}
 
 
@@ -97,14 +100,15 @@ def old_path(path):
 
 
 def room_paths(room):
-    """部屋ごとのフォルダと、その中のログ・招待の場所。今までの場所（~/.claude-room 直下）にあれば移す。"""
+    """部屋ごとのフォルダと、その中のログ・招待の場所。
+
+    古い版の場所（~/.claude-room 直下の <部屋>.jsonl など）からは、自動で移さない。
+    古い版のファイル名からは、どの部屋のものか（退避したログか、別の部屋のログか）を見分けられず、
+    別の部屋の会話を取り込んでしまうおそれがあるため。
+    """
     d = DATA_DIR / "rooms" / room
     d.mkdir(parents=True, exist_ok=True)
-    log_path, inv_path = d / "log.jsonl", d / "invites.json"
-    for legacy, new in ((DATA_DIR / f"{room}.jsonl", log_path), (DATA_DIR / f"invites-{room}.json", inv_path)):
-        if legacy.exists() and not new.exists():
-            legacy.replace(new)
-    return d, log_path, inv_path
+    return d, d / "log.jsonl", d / "invites.json"
 
 
 class Denied(Exception):
@@ -280,28 +284,36 @@ class Room:
             return v
         paused, muted = flag("paused"), flag("muted")
         add, maxt = count("add_turns", 1), count("max_turns", 0)
-        target = d.get("agent") if isinstance(d.get("agent"), str) else ""
+        target = d.get("agent")
+        if muted is not None and not isinstance(target, str):
+            raise Denied(400, "止める AI の名前（agent）が必要です")
         with self.cond:
             if check is not None and not check():
                 raise Denied(401, "この招待は取り消されました")
+            if muted is not None and target not in self.agents:
+                raise Denied(404, f"{target} は部屋にいません")
+            # 変更を先に決め、記録（ログ）に書けたときだけ反映する（書けなければ何も変えない）
             notes = []
+            new_paused, new_max = self.paused, self.max_turns
             if paused is not None and paused != self.paused:
-                self.paused = paused
+                new_paused = paused
                 notes.append("全員の AI を止めました" if paused else "AI を再開しました")
-            if muted is not None and target in self.agents and muted != self.agents[target]["muted"]:
-                self.agents[target]["muted"] = muted
+            new_muted = None
+            if muted is not None and muted != self.agents[target]["muted"]:
+                new_muted = muted
                 notes.append(f"{target} を" + ("止めました" if muted else "再開しました"))
-            if add is not None and self.max_turns:
-                new = min(MAX_TURNS_LIMIT, self.auto_turns + add)
-                if new != self.max_turns:
-                    self.max_turns = new
-                    notes.append(f"AI の連続発言の上限を {self.max_turns} 回にしました")
-            if maxt is not None and maxt != self.max_turns:
-                self.max_turns = maxt
-                notes.append("AI の連続発言の上限をなくしました" if not maxt
-                             else f"AI の連続発言の上限を {maxt} 回にしました")
-            for n in notes:
-                self.post("system", "system", f"{by}が{n}")
+            if maxt is not None:
+                new_max = maxt
+            if add is not None and new_max:
+                new_max = min(MAX_TURNS_LIMIT, self.auto_turns + add)
+            if new_max != self.max_turns:
+                notes.append("AI の連続発言の上限をなくしました" if not new_max
+                             else f"AI の連続発言の上限を {new_max} 回にしました")
+            if notes:
+                self.post("system", "system", f"{by}が" + "、".join(notes))     # 失敗したら Denied（507）
+            self.paused, self.max_turns = new_paused, new_max
+            if new_muted is not None:
+                self.agents[target]["muted"] = new_muted
             self._bump()
             return self.state()
 
@@ -692,12 +704,19 @@ def make_handler(room, key, invites):
                         st = room.state()
                         if not backlog:
                             v = room.version
-                    out = []
+                    # 小さく分けて書く（1 回の書き込みが大きいと、遅い相手には送信の制限時間を超えてしまう）
+                    buf = []
+                    size = 0
                     for m in msgs:
-                        out.append("event: msg\ndata: " + json.dumps(m, ensure_ascii=False) + "\n\n")
+                        ev = ("event: msg\ndata: " + json.dumps(m, ensure_ascii=False) + "\n\n").encode()
+                        buf.append(ev)
+                        size += len(ev)
                         after = m["seq"]
-                    out.append("event: state\ndata: " + json.dumps(st, ensure_ascii=False) + "\n\n")
-                    self.wfile.write("".join(out).encode())
+                        if size >= 64 * 1024:
+                            self.wfile.write(b"".join(buf))
+                            buf, size = [], 0
+                    buf.append(("event: state\ndata: " + json.dumps(st, ensure_ascii=False) + "\n\n").encode())
+                    self.wfile.write(b"".join(buf))
                     self.wfile.flush()
             except OSError:
                 pass
@@ -1037,6 +1056,8 @@ class Panel:
                  "incoming": [{"seq": m["seq"], "name": m["name"], "text": m["text"][:400]} for m in talk],
                  "steps": [], "pending": None}
             self.turns.append(t)
+            if len(self.turns) > 500:             # メモリに置くターンは 500 まで（記録はファイルに残る）
+                del self.turns[:len(self.turns) - 500]
             self._bump()
             return t
 
@@ -1058,6 +1079,7 @@ class Panel:
             self.decisions.pop(turn["id"], None)
             self._bump()
         last_check = 0.0
+        last_ok = time.time()
         while True:
             with self.lock:
                 self.lock.wait(timeout=1)
@@ -1069,14 +1091,19 @@ class Panel:
                 return d
             if time.time() - last_check > 2:
                 last_check = time.time()
+                held = self.agent.keep_floor()
+                if held:
+                    last_ok = time.time()
                 try:
-                    if self.agent.keep_floor() is False or halted():   # 発言権を失った・止められた
-                        with self.lock:
-                            turn["pending"] = None
-                            self._bump()
-                        raise Stopped()
+                    stop = held is False or halted()        # 発言権を失った・止められた
                 except (OSError, ValueError):
-                    pass
+                    stop = False
+                # 部屋と連絡がつかないまま長く待たない（そのあいだ発言権を確かめられないため）
+                if stop or time.time() - last_ok > FLOOR_UNREACHABLE:
+                    with self.lock:
+                        turn["pending"] = None
+                        self._bump()
+                    raise Stopped()
 
     def stats(self):
         flagged = sum(1 for t in self.turns for s in t["steps"] if s.get("kind") == "check" and not s["ok"])
@@ -1136,14 +1163,15 @@ class Panel:
                     if not self.server.begin_stream(self.connection):
                         return self._json(503, {"error": "busy"})
                     try:
-                        with panel.lock:
+                        with panel.lock:     # ロックの中では内容を決めるだけ。JSON にして送るのは外で
                             panel.lock.wait_for(lambda: panel.version != v, timeout=20)
                             ag = panel.agent
-                            return self._json(200, {
+                            body = json.loads(json.dumps({
                                 "version": panel.version, "me": ag.me, "owner": ag.owner, "room": ag.room,
                                 "policy": ag.policy_text, "secrets": ag.secret_items, "words": ag.words,
                                 "guard": ag.args.guard, "confirm": ag.args.confirm,
-                                "turns": panel.turns[-60:], "stats": panel.stats()})
+                                "turns": panel.turns[-60:], "stats": panel.stats()}))
+                        return self._json(200, body)
                     finally:
                         self.server.end_stream()
                 self._json(404, {})
@@ -1221,7 +1249,9 @@ class Agent:
         if not self.panel.url and (self.guarded or args.confirm):
             sys.exit("代理人パネルを開けませんでした。確認が必要になったときに操作できないので、中止します"
                      "（--panel-port で別のポートを指定してください）")
-        self.record_path = DATA_DIR / f"agent-{self.me}.jsonl"
+        # 代理人の記録: AI の名前ごとのフォルダに、起動ごとのファイルで（名前や古い記録の名前がぶつからない）
+        rec_dir = _ensure_dir(DATA_DIR / "records" / self.me)
+        self.record_path = rec_dir / f"{time.strftime('%Y%m%d-%H%M%S')}-{secrets.token_hex(3)}.jsonl"
         self._record_warned = False
         self._fails = {}
         self._q = f"&name={quote(self.me)}&owner={quote(self.owner)}&agent={self.product}"
@@ -1256,8 +1286,9 @@ class Agent:
         if src is not None:
             try:
                 os.symlink(src, auth)
-            except OSError:
-                pass
+            except OSError as e:
+                sys.exit(f"Codex のログイン情報へのリンクを作れません（{e}）。Windows では、開発者モードを"
+                         "有効にするか、管理者として実行してください")
         if not auth.exists():
             _ensure_dir(auth_home)
             env_set = (f'$env:CODEX_HOME="{auth_home}"; codex login' if os.name == "nt"
@@ -1290,14 +1321,13 @@ class Agent:
             headers={"Authorization": "Bearer " + self.key, "Content-Type": "application/json"})
         try:
             with urllib.request.urlopen(req, timeout=timeout) as r:
-                data = r.read(MAX_RESPONSE + 1)
+                return read_json(r, MAX_RESPONSE)
         except urllib.error.HTTPError as e:
             if e.code in (401, 403):
-                raise Kicked(_http_error(e))
+                msg = _http_error(e)
+                e.close()
+                raise Kicked(msg)
             raise
-        if len(data) > MAX_RESPONSE:
-            raise ValueError("ホストからの応答が大きすぎます")
-        return json.loads(data)
 
     # ホストは信頼しない: ホストから来た値は、型と形式を確かめてから使う
     @staticmethod
@@ -1396,10 +1426,12 @@ class Agent:
 
     def _read_more(self, r, st):
         """「続きあり」のあいだ、溜まっている発言を読む。読んでも進まなければ打ち切る（悪意のあるホスト対策）。"""
-        while isinstance(r, dict) and r.get("more") is True:
+        pages = 0
+        while isinstance(r, dict) and r.get("more") is True and pages < MAX_PAGES:   # 1 回に読むページ数も限る
             before = self._last_seq()
             r = self.api("GET", f"/api/messages?after={before}")
             st = self._absorb(r)
+            pages += 1
             if self._last_seq() <= before:
                 break
         return st
@@ -1720,6 +1752,11 @@ class Agent:
                     os.killpg(p.pid, 9)
                 except OSError:
                     pass
+            elif p.poll() is None:      # Windows: 子と孫をまとめて止める
+                try:
+                    subprocess.run(["taskkill", "/T", "/F", "/PID", str(p.pid)], capture_output=True, timeout=10)
+                except (OSError, subprocess.SubprocessError):
+                    pass
             if p.poll() is None:
                 try:
                     p.kill()
@@ -1909,17 +1946,31 @@ def cmd_host(a):
     Agent(f"http://{up[0]}:{a.port}", key, a.name, a).run()
 
 
+def read_json(resp, limit):
+    """応答を最大 limit バイトだけ読み、JSON として返す。大きすぎたり壊れていたりしたら ValueError。"""
+    data = resp.read(limit + 1)
+    if len(data) > limit:
+        raise ValueError("応答が大きすぎます")
+    try:
+        return json.loads(data)
+    except ValueError:
+        raise ValueError("応答が JSON ではありません")
+
+
 def _get_json(url, key, data=None):
     req = urllib.request.Request(url, method="POST" if data is not None else "GET",
                                  data=json.dumps(data).encode() if data is not None else None,
                                  headers={"Authorization": "Bearer " + key, "Content-Type": "application/json"})
     with urllib.request.urlopen(req, timeout=15) as r:
-        return json.loads(r.read())
+        return read_json(r, MAX_RESPONSE)
 
 
 def _http_error(e):
+    """エラーの応答から説明を取り出す（大きさを限り、形も確かめる）。"""
     try:
-        return json.loads(e.read()).get("error") or str(e)
+        body = read_json(e, MAX_ERROR_BODY)
+        msg = body.get("error") if isinstance(body, dict) else None
+        return str(msg)[:300] if msg else str(e)
     except (ValueError, OSError):
         return str(e)
 
@@ -1936,6 +1987,8 @@ def cmd_join(a):
         sys.exit("この招待は使えません（取り消されたか、URL が違います）" if e.code == 401 else f"接続できません: {e}")
     except OSError as e:
         sys.exit(f"接続できません: {e}\n  （ネットワークがつながっているか、URL が正しいかを確かめてください）")
+    except ValueError as e:
+        sys.exit(f"ホストからの応答がおかしいので、参加をやめます: {e}")
     name = a.name or getpass.getuser()
     if not isinstance(me, dict):
         sys.exit("ホストからの応答の形がおかしいので、参加をやめます")

@@ -349,6 +349,56 @@ class ServerTests(unittest.TestCase):
         tail = call(self.base, "/api/messages?tail=1", self.key)[1]["messages"]
         self.assertEqual(tail[-1]["text"], "m1199")
 
+    def test_slow_stream_reader_does_not_block_others(self):
+        # 大きな発言を溜めておき、受信を始めたまま読まない相手がいても、ほかの人の投稿は止まらない
+        n = 600                                                    # 500 件ずつの区切りを、2 回またぐ
+        for i in range(n):
+            self.room.post("alice", "human", f"{i:04d}" + "x" * 19000)
+        s = socket.create_connection(("127.0.0.1", self.srv.server_address[1]), timeout=30)
+        s.setsockopt(socket.SOL_SOCKET, socket.SO_RCVBUF, 65536)
+        s.sendall(f"GET /api/stream?after=0 HTTP/1.1\r\nHost: x\r\nAuthorization: Bearer {self.carol}\r\n\r\n".encode())
+        time.sleep(1)                                             # 送り手が詰まるまで待つ（約 11MB は溜めきれない）
+        t = time.time()
+        code = call(self.base, "/api/send", self.bob, {"name": "bob", "text": "まだ話せる"}, timeout=5)[0]
+        self.assertEqual(code, 200)
+        self.assertLess(time.time() - t, 3)
+        # 最後まで読むと、すべてが順番どおりに届いている
+        buf, seqs, headers_done = b"", [], False
+        s.settimeout(30)
+        while len(seqs) < n + 1:
+            chunk = s.recv(1 << 16)
+            if not chunk:
+                break
+            buf += chunk
+            if not headers_done:
+                if b"\r\n\r\n" not in buf:
+                    continue
+                buf = buf.split(b"\r\n\r\n", 1)[1]
+                headers_done = True
+            while b"\n\n" in buf:
+                ev, buf = buf.split(b"\n\n", 1)
+                if ev.startswith(b"event: msg"):
+                    seqs.append(json.loads(ev.split(b"data: ", 1)[1])["seq"])
+        s.close()
+        self.assertEqual(seqs, list(range(1, n + 2)))
+
+    def test_control_rejects_bad_agent_and_log_failure(self):
+        code = call(self.base, "/api/control", self.bob, {"by": "bob", "paused": True, "agent": [], "muted": True})[0]
+        self.assertEqual(code, 400)
+        self.assertFalse(self.room.paused)
+        code = call(self.base, "/api/control", self.bob, {"by": "bob", "paused": True, "agent": "claude-x", "muted": True})[0]
+        self.assertEqual(code, 404)
+        self.assertFalse(self.room.paused)
+        # ログに書けないときは、何も変えない
+        real = self.room.log_path
+        self.room.log_path = Path(tempfile.mkdtemp(dir=_TMP))          # フォルダなので、書けない
+        try:
+            code = call(self.base, "/api/control", self.bob, {"by": "bob", "paused": True})[0]
+        finally:
+            self.room.log_path = real
+        self.assertEqual(code, 507)
+        self.assertFalse(self.room.paused)
+
     @unittest.skipUnless(POSIX, "POSIX のファイル権限")
     def test_log_is_private(self):
         self.room.post("alice", "human", "secret")
@@ -372,6 +422,13 @@ class StorageTests(unittest.TestCase):
         self.assertNotEqual(cr.old_path(a), b)
         self.assertNotEqual(a.parent, b.parent)
 
+    def test_legacy_files_are_not_migrated(self):
+        legacy = cr.DATA_DIR / "legacyroom.old.jsonl"
+        legacy.write_text('{"seq": 1, "ts": 0, "name": "x", "kind": "human", "text": "別の部屋の秘密"}\n')
+        d, log_path, _ = cr.room_paths("legacyroom.old")
+        self.assertFalse(log_path.exists())                       # 古い場所のファイルを、勝手に取り込まない
+        self.assertTrue(legacy.exists())
+
     def test_rotation_keeps_history_on_restart(self):
         d = Path(tempfile.mkdtemp(dir=_TMP))
         old = cr.MAX_LOG_BYTES
@@ -382,9 +439,11 @@ class StorageTests(unittest.TestCase):
                 room.post("alice", "human", f"m{i}")
             self.assertTrue(cr.old_path(d / "log.jsonl").exists())
             again = cr.Room("r", d / "log.jsonl", 0)
-            texts = [m["text"] for m in again.messages]
-            self.assertIn("m19", texts)
-            self.assertGreater(len(texts), 5)                      # 切り替えの直前の会話も戻る
+            on_disk = []
+            for p in (cr.old_path(d / "log.jsonl"), d / "log.jsonl"):
+                on_disk += [json.loads(l)["text"] for l in p.read_text().splitlines()]
+            self.assertEqual([m["text"] for m in again.messages], on_disk)   # 残っているログを全部、順番どおりに
+            self.assertEqual(on_disk[-1], "m19")
         finally:
             cr.MAX_LOG_BYTES = old
 
@@ -400,8 +459,9 @@ class FakeHost:
                 pass
 
             def do_GET(self):
-                body = json.dumps(routes_.get(self.path.split("?")[0], {})).encode()
-                self.send_response(200)
+                route = routes_.get(self.path.split("?")[0], {})
+                status, body = route if isinstance(route, tuple) else (200, json.dumps(route).encode())
+                self.send_response(status)
                 self.send_header("Content-Type", "application/json")
                 self.send_header("Content-Length", str(len(body)))
                 self.end_headers()
@@ -453,6 +513,42 @@ class MaliciousHostTests(unittest.TestCase):
         ag = self._stub_agent([bad] * 1000)
         st = ag._read_more(bad, ag._absorb(bad))                   # 空の「続きあり」でも、落ちずに打ち切る
         self.assertEqual(st["room"], "room")
+
+    def test_more_with_progress_is_bounded(self):
+        seq = iter(range(1, 10 ** 6))
+
+        def endless(*a, **k):
+            n = next(seq)
+            return {"messages": [{"seq": n, "ts": 0, "name": "x", "kind": "human", "text": "x"}],
+                    "state": {}, "more": True}
+        ag = self._stub_agent([])
+        calls = []
+        ag.api = lambda *a, **k: calls.append(1) or endless()
+        first = endless()
+        ag._read_more(first, ag._absorb(first))
+        self.assertLessEqual(len(calls), cr.MAX_PAGES)             # 進み続けても、読むページ数には上限がある
+
+    def test_join_rejects_broken_json(self):
+        host = FakeHost({"/api/me": (200, b"not json")})
+        try:
+            with self.assertRaises(SystemExit):
+                cr.cmd_join(argparse.Namespace(url=host.base + "/#key=abc", key=None, name=None))
+        finally:
+            host.close()
+
+    def test_error_bodies_are_bounded_and_typed(self):
+        host = FakeHost({"/list": (401, b"[]"), "/huge": (500, b"x" * (cr.MAX_ERROR_BODY * 4))})
+        try:
+            ag = object.__new__(cr.Agent)
+            ag.base, ag.key = host.base, "k"
+            with self.assertRaises(cr.Kicked):                     # 本文が [] でも、落ちずに「外された」になる
+                ag.api("GET", "/list")
+            with self.assertRaises(urllib.error.HTTPError) as cm:
+                ag.api("GET", "/huge")
+            self.assertLess(len(cr._http_error(cm.exception)), 1000)
+            cm.exception.close()
+        finally:
+            host.close()
 
     def test_huge_timestamp(self):
         m = cr.Agent._clean_msg({"seq": 1, "ts": 10 ** 400, "name": "bob", "kind": "human", "text": "x"})
@@ -573,14 +669,15 @@ class ProcessTests(unittest.TestCase):
         with self.assertRaises(cr.Stopped):
             ag._run_process([sys.executable, "-c", code], "")
         pid = int(pidfile.read_text())
-        time.sleep(0.5)
-        try:
-            os.kill(pid, 0)
-            with open(f"/proc/{pid}/stat") as f:          # ゾンビなら、止まっている
-                alive = f.read().split()[2] != "Z"
-        except (ProcessLookupError, FileNotFoundError):
-            alive = False
-        self.assertFalse(alive, "孫のプロセスが残っている")
+        deadline = time.time() + 5
+        while time.time() < deadline:
+            # ps は Linux でも Mac でも使える。出力が空か Z（ゾンビ）なら、止まっている
+            st = subprocess.run(["ps", "-o", "stat=", "-p", str(pid)], capture_output=True, text=True).stdout.strip()
+            if not st or st.startswith("Z"):
+                break
+            time.sleep(0.1)
+        else:
+            self.fail(f"孫のプロセスが残っている（状態 {st}）")
 
     def test_child_is_killed_when_stopped(self):
         ag = self._agent()
@@ -621,6 +718,8 @@ class CodexTests(unittest.TestCase):
                                               panel_port=0, confirm=False)
             a, b = cr.Agent("http://x", "k", "bob", args()), cr.Agent("http://x", "k", "bob", args())
             self.assertNotEqual(a.codex_home, b.codex_home)      # 同じ名前でも、設定のフォルダは別
+            self.assertNotEqual(a.record_path, b.record_path)    # 記録も別のファイル
+            self.assertEqual(a.record_path.parent.name, "codex-bob")
             self.assertTrue((a.codex_home / "auth.json").exists())
             a.panel.close()
             b.panel.close()
@@ -648,6 +747,19 @@ class PanelTests(unittest.TestCase):
         self.assertEqual(call(self.base, "/api/state?v=-1", headers={"X-Token": self.panel.token})[0], 200)
         # DNS リバインディング: 別の名前で来た要求は断る
         self.assertEqual(call(self.base, "/", headers={"Host": "evil.example:80"})[0], 403)
+
+    def test_approval_stops_when_room_unreachable(self):
+        self.panel.agent.keep_floor = lambda: None                  # 部屋と連絡がつかない
+        old = cr.FLOOR_UNREACHABLE
+        cr.FLOOR_UNREACHABLE = 1
+        try:
+            turn = self.panel.new_turn([])
+            t = time.time()
+            with self.assertRaises(cr.Stopped):
+                self.panel.wait_decision(turn, "下書き", None, lambda: False)
+            self.assertLess(time.time() - t, 10)
+        finally:
+            cr.FLOOR_UNREACHABLE = old
 
     def test_panel_escapes_seq_and_has_csp(self):
         self.assertIn("#${esc(String(m.seq))}", cr.PANEL_PAGE)
