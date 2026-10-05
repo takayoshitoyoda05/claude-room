@@ -458,17 +458,85 @@ TAILSCALE_PATHS = [
 ]
 
 
-def tailscale_ip():
-    for exe in [shutil.which("tailscale")] + TAILSCALE_PATHS:
-        if not exe or not os.path.exists(exe):
-            continue
-        try:
-            out = subprocess.run([exe, "ip", "-4"], capture_output=True, text=True, timeout=5).stdout.split()
-        except (OSError, subprocess.SubprocessError):
-            continue
-        if out:
-            return out[0]
+def tailscale_exe():
+    for exe in [os.environ.get("CLAUDE_ROOM_TAILSCALE"), shutil.which("tailscale")] + TAILSCALE_PATHS:
+        if exe and os.path.exists(exe):
+            return exe
     return None
+
+
+def tailscale_ip():
+    exe = tailscale_exe()
+    if not exe:
+        return None
+    try:
+        out = subprocess.run([exe, "ip", "-4"], capture_output=True, text=True, timeout=5).stdout.split()
+    except (OSError, subprocess.SubprocessError):
+        return None
+    return out[0] if out else None
+
+
+def start_funnel(port, https_port):
+    """Tailscale Funnel で、部屋（127.0.0.1:port）だけをインターネットに HTTPS で公開する。
+
+    --bg は使わない。部屋の子プロセスとして動かすので、部屋を閉じると公開も止まる
+    （--bg で公開すると、再起動後も公開が残り続ける）。
+    """
+    exe = tailscale_exe()
+    if not exe:
+        sys.exit("tailscale コマンドが見つかりません（--public には、ホストの PC の Tailscale が必要です）")
+    try:
+        dns = json.loads(subprocess.run([exe, "status", "--json"], capture_output=True, text=True,
+                                        timeout=10).stdout)["Self"]["DNSName"].rstrip(".")
+    except (OSError, ValueError, KeyError, subprocess.SubprocessError):
+        sys.exit("Tailscale の状態を読めません（tailscale status で、つながっているかを確かめてください）")
+    url = f"https://{dns}" + ("" if https_port == 443 else f":{https_port}")
+    kw = {}
+    if sys.platform.startswith("linux"):
+        def _die_with_parent():   # 部屋が強制終了されても、公開を残さない
+            try:
+                import ctypes
+                import signal
+                ctypes.CDLL("libc.so.6").prctl(1, signal.SIGTERM)   # PR_SET_PDEATHSIG
+            except (OSError, AttributeError):
+                pass
+        kw["preexec_fn"] = _die_with_parent
+    proc = subprocess.Popen([exe, "funnel", f"--https={https_port}", f"http://127.0.0.1:{port}"],
+                            stdin=subprocess.DEVNULL, stdout=subprocess.PIPE, stderr=subprocess.STDOUT,
+                            text=True, encoding="utf-8", errors="replace", **kw)
+    out, ready = [], threading.Event()
+
+    def reader():
+        for line in proc.stdout:
+            out.append(line.rstrip())
+            if "https://" in line:
+                ready.set()
+        ready.set()
+    threading.Thread(target=reader, daemon=True).start()
+    ready.wait(30)
+    if proc.poll() is not None or not any("https://" in x for x in out):
+        try:
+            proc.terminate()
+        except OSError:
+            pass
+        text = "\n".join(out[-15:])
+        hint = ""
+        if "denied" in text.lower() or "operator" in text.lower():
+            hint = "\n  → Linux では、先に一度だけ: sudo tailscale set --operator=$USER"
+        elif "funnel" in text.lower() and ("enable" in text.lower() or "not" in text.lower()):
+            hint = "\n  → Tailscale の管理画面で、HTTPS と Funnel を有効にしてください（README の「インターネットに公開する」）"
+        sys.exit(f"Funnel を始められませんでした。tailscale の出力:\n{text}{hint}")
+
+    def stop():
+        if proc.poll() is None:
+            proc.terminate()
+            try:
+                proc.wait(5)
+            except subprocess.TimeoutExpired:
+                proc.kill()
+    import atexit
+    atexit.register(stop)
+    return url
 
 
 def load_key(rotate):
@@ -1059,10 +1127,16 @@ def cmd_host(a):
     if a.fresh and log_path.exists():
         log_path.rename(log_path.with_name(f"{a.room}-{time.strftime('%Y%m%d-%H%M%S')}.jsonl"))
     room = Room(a.room, log_path, a.max_turns)
-    binds = a.bind or [b for b in (tailscale_ip(), "127.0.0.1") if b]
-    up = serve(room, key, binds, a.port)
-    public = [h for h in up if not h.startswith("127.")]
-    room.invite_bases = [f"http://{h}:{a.port}" for h in public]
+    if a.public:
+        # 公開するときは 127.0.0.1 だけで待ち受け、Funnel 経由でだけ外から届くようにする
+        up = serve(room, key, ["127.0.0.1"], a.port)
+        room.invite_bases = [start_funnel(a.port, a.public_port)]
+        public = room.invite_bases
+    else:
+        binds = a.bind or [b for b in (tailscale_ip(), "127.0.0.1") if b]
+        up = serve(room, key, binds, a.port)
+        public = [h for h in up if not h.startswith("127.")]
+        room.invite_bases = [f"http://{h}:{a.port}" for h in public]
 
     print()
     print(f"  Claude Room   ルーム「{a.room}」")
@@ -1078,6 +1152,9 @@ def cmd_host(a):
         print("  [注意] Tailscale のアドレスが見つからないため、この PC の中からしか開けません")
         print("         相手を入れるには、--bind <この PC のアドレス> で待ち受けるアドレスを指定してください")
     print("  ※ 招待URLは鍵そのもの。信頼できる相手にだけ、1 対 1 で渡してください")
+    if a.public:
+        print("  ※ インターネットに公開中です（Tailscale Funnel）。相手は Tailscale なしで入れます")
+        print("     この部屋を閉じると（Ctrl+C）、公開も止まります")
     print()
 
     if a.no_claude:
@@ -1108,6 +1185,10 @@ def main():
     h.add_argument("--bind", action="append", help="待ち受けアドレス（既定: Tailscale のアドレスと 127.0.0.1）")
     h.add_argument("--max-turns", type=int, default=0,
                    help="人間の発言なしに Claude 同士が続ける回数の上限（既定 0＝上限なし）")
+    h.add_argument("--public", action="store_true",
+                   help="Tailscale Funnel で部屋をインターネットに公開する（相手は Tailscale 不要）。部屋を閉じると公開も止まる")
+    h.add_argument("--public-port", type=int, choices=[443, 8443, 10000], default=443,
+                   help="公開に使う HTTPS のポート（Funnel が使えるのは 443・8443・10000）")
     h.add_argument("--no-claude", action="store_true", help="自分の Claude は参加させない")
     h.add_argument("--new-key", action="store_true", help="鍵を作り直す（古い招待URLは使えなくなる）")
     h.add_argument("--fresh", action="store_true", help="これまでのログを退避して、空の部屋から始める")
