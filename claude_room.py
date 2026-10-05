@@ -16,6 +16,7 @@ import os
 import re
 import secrets
 import shutil
+import socket
 import subprocess
 import sys
 import threading
@@ -31,6 +32,11 @@ __version__ = "0.1.0"
 REPO_URL = "https://github.com/takayoshitoyoda05/claude-room"
 DATA_DIR = Path(os.environ.get("CLAUDE_ROOM_HOME", Path.home() / ".claude-room"))
 MAX_TEXT = 20000
+MAX_CONN = 64              # 同時に受け付ける接続の上限
+MAX_STREAMS = 32           # そのうち、待ち受け（SSE・ロングポーリング）に使える数
+HEADER_DEADLINE = 15       # 要求を送り終えるまでの制限時間（秒）。わざと遅く送る攻撃への備え
+SOCKET_TIMEOUT = 20        # 1 回の読み書きの制限時間（秒）
+FAIL_WINDOW, FAIL_LIMIT = 60, 20   # 60 秒に 20 回、鍵を間違えたら、しばらく 429 で断る
 FLOOR_LEASE = 900          # 発言権の有効期限（秒）。Claude が落ちても部屋が固まらないように
 ONLINE_SECS = 75           # この秒数ハートビートがなければオフライン扱い
 DEFAULT_TOOLS = "Read,Grep,Glob"
@@ -160,10 +166,102 @@ class Room:
                 self._bump()
 
 
-def make_handler(room, key):
-    source = Path(__file__).read_bytes()
+class HardenedServer(ThreadingHTTPServer):
+    """標準の ThreadingHTTPServer に、接続数の上限と、要求を送り終えるまでの制限時間を足したもの。"""
+    daemon_threads = True
 
+    def __init__(self, *a, **kw):
+        super().__init__(*a, **kw)
+        self._lock = threading.Lock()
+        self._active = 0
+        self._streams = 0
+        self._pending = {}           # 要求の受け取りが終わっていない接続 -> 受け付けた時刻
+        self._fails = {}             # 送信元 -> 鍵を間違えた時刻のリスト
+        self._warned = 0.0
+        threading.Thread(target=self._reaper, daemon=True).start()
+
+    def process_request(self, request, client_address):
+        with self._lock:
+            if self._active >= MAX_CONN:
+                self.shutdown_request(request)
+                return
+            self._active += 1
+            self._pending[request] = time.time()
+        try:
+            super().process_request(request, client_address)
+        except Exception:
+            with self._lock:
+                self._active -= 1
+                self._pending.pop(request, None)
+            raise
+
+    def process_request_thread(self, request, client_address):
+        try:
+            super().process_request_thread(request, client_address)
+        finally:
+            with self._lock:
+                self._active -= 1
+                self._pending.pop(request, None)
+
+    def handle_error(self, request, client_address):
+        # 相手が切った・こちらが切った接続のエラーは、ターミナルに出さない
+        if isinstance(sys.exc_info()[1], (OSError, ValueError)):
+            return
+        super().handle_error(request, client_address)
+
+    def _reaper(self):
+        while True:
+            time.sleep(2)
+            now = time.time()
+            with self._lock:
+                late = [r for r, t in self._pending.items() if now - t > HEADER_DEADLINE]
+                for r in late:
+                    self._pending.pop(r, None)
+            for r in late:
+                try:
+                    r.shutdown(socket.SHUT_RDWR)
+                except OSError:
+                    pass
+
+    def begin_stream(self, request):
+        """長く待つ要求（鍵の確認済み）を、制限時間の対象から外す。上限を超えたら False。"""
+        with self._lock:
+            if self._streams >= MAX_STREAMS:
+                return False
+            self._streams += 1
+            self._pending.pop(request, None)
+            return True
+
+    def end_stream(self):
+        with self._lock:
+            self._streams -= 1
+
+    def too_many_fails(self, ip):
+        with self._lock:
+            now = time.time()
+            recent = [t for t in self._fails.get(ip, []) if now - t < FAIL_WINDOW]
+            self._fails[ip] = recent
+            return len(recent) >= FAIL_LIMIT
+
+    def record_fail(self, ip):
+        with self._lock:
+            now = time.time()
+            self._fails.setdefault(ip, []).append(now)
+            if len(self._fails) > 1000:          # 送信元が多すぎるときは古い記録を捨てる
+                self._fails = {k: v for k, v in self._fails.items() if v and now - v[-1] < FAIL_WINDOW}
+            warn = len(self._fails[ip]) >= FAIL_LIMIT and now - self._warned > 60
+            if warn:
+                self._warned = now
+        if warn:
+            log(f"[警告] 鍵の間違いが続いています（送信元 {ip}）。しばらく断ります")
+
+
+def make_handler(room, key):
     class Handler(BaseHTTPRequestHandler):
+        server_version = "claude-room"
+        sys_version = ""
+        timeout = SOCKET_TIMEOUT
+
         def log_message(self, *a):
             pass
 
@@ -178,28 +276,41 @@ def make_handler(room, key):
         def _json(self, code, obj):
             self._send(code, json.dumps(obj, ensure_ascii=False).encode(), "application/json; charset=utf-8")
 
-        def _authed(self, qs):
+        def _authed(self):
+            """鍵はヘッダーでだけ受け取る（URL に載せると、記録や履歴に残りうるため）。"""
             got = self.headers.get("Authorization", "")
-            got = got[7:] if got.startswith("Bearer ") else qs.get("key", [""])[0]
-            return secrets.compare_digest(got.encode(), key.encode())
+            ok = got.startswith("Bearer ") and secrets.compare_digest(got[7:].encode(), key.encode())
+            if ok:
+                return True
+            ip = self.client_address[0]
+            if self.server.too_many_fails(ip):
+                self._json(429, {"error": "too many attempts"})
+            else:
+                self.server.record_fail(ip)
+                self._json(401, {"error": "bad key"})
+            return False
 
         def _body(self):
             n = int(self.headers.get("Content-Length") or 0)
-            if n > 4 * MAX_TEXT:
-                raise ValueError("too large")
+            if n < 0 or n > 4 * MAX_TEXT:
+                raise ValueError("bad length")
             return json.loads(self.rfile.read(n) or b"{}")
 
         def do_GET(self):
+            try:
+                self._get()
+            except ValueError:
+                self._json(400, {"error": "bad request"})
+
+        def _get(self):
             u = urlparse(self.path)
             qs = parse_qs(u.query)
             if u.path == "/":
                 return self._send(200, PAGE.replace("__REPO_URL__", REPO_URL).encode(), "text/html; charset=utf-8")
-            if u.path == "/claude_room.py":
-                return self._send(200, source, "text/x-python; charset=utf-8")
             if u.path == "/api/ping":
                 return self._json(200, {"ok": True})
-            if not self._authed(qs):
-                return self._json(401, {"error": "bad key"})
+            if not self._authed():
+                return
             after = int(qs.get("after", ["0"])[0])
             if u.path == "/api/messages":
                 with room.cond:
@@ -211,15 +322,28 @@ def make_handler(room, key):
                         return self._json(400, {"error": "bad name"})
                     room.heartbeat(name, owner)
                 v = int(qs.get("v", ["-1"])[0])
-                timeout = min(float(qs.get("timeout", ["25"])[0]), 50)
-                with room.cond:
-                    room.cond.wait_for(lambda: room.version != v, timeout=timeout)
-                    return self._json(200, {"messages": room.since(after), "state": room.state()})
+                timeout = max(0.0, min(float(qs.get("timeout", ["25"])[0]), 50))
+                if not self.server.begin_stream(self.connection):
+                    return self._json(503, {"error": "busy"})
+                try:
+                    with room.cond:
+                        room.cond.wait_for(lambda: room.version != v, timeout=timeout)
+                        return self._json(200, {"messages": room.since(after), "state": room.state()})
+                finally:
+                    self.server.end_stream()
             if u.path == "/api/stream":
                 return self._stream(after)
             self._json(404, {"error": "not found"})
 
         def _stream(self, after):
+            if not self.server.begin_stream(self.connection):
+                return self._json(503, {"error": "busy"})
+            try:
+                self._stream_body(after)
+            finally:
+                self.server.end_stream()
+
+        def _stream_body(self, after):
             self.send_response(200)
             self.send_header("Content-Type", "text/event-stream; charset=utf-8")
             self.send_header("Cache-Control", "no-store")
@@ -249,12 +373,20 @@ def make_handler(room, key):
                     room._bump()
 
         def do_POST(self):
+            try:
+                self._post()
+            except (ValueError, TypeError):
+                self._json(400, {"error": "bad request"})
+
+        def _post(self):
             u = urlparse(self.path)
-            if not self._authed(parse_qs(u.query)):
-                return self._json(401, {"error": "bad key"})
+            if not self._authed():
+                return
             try:
                 d = self._body()
             except ValueError:
+                return self._json(400, {"error": "bad body"})
+            if not isinstance(d, dict):
                 return self._json(400, {"error": "bad body"})
             name = str(d.get("name") or d.get("by") or "").strip()
             if name and not NAME_RE.fullmatch(name):
@@ -309,11 +441,10 @@ def serve(room, key, binds, port):
     servers = []
     for host in binds:
         try:
-            srv = ThreadingHTTPServer((host, port), make_handler(room, key))
+            srv = HardenedServer((host, port), make_handler(room, key))
         except OSError as e:
             log(f"[警告] {host}:{port} で待ち受けできません: {e}")
             continue
-        srv.daemon_threads = True
         threading.Thread(target=srv.serve_forever, daemon=True).start()
         servers.append(host)
     if not servers:
@@ -597,6 +728,20 @@ class Agent:
             except OSError as e:
                 sys.exit(f"秘密の設定ファイルを読めません: {e}")
         self.guarded = bool(self.policy_text) and args.guard != "off"
+        # Claude が読めるのは作業ディレクトリの中だけ。既定は専用の空のフォルダにして、
+        # 相手に仕向けられても手元のファイルを読み上げないようにする
+        if not args.workdir:
+            args.workdir = str(DATA_DIR / "work" / self.me)
+        Path(args.workdir).mkdir(parents=True, exist_ok=True)
+        # --safe-mode: CLAUDE.md・MCP・フック・プラグインを読み込まない（読み込むと、その中身が相手に漏れうる）
+        try:
+            help_text = subprocess.run([self.claude, "--help"], capture_output=True, text=True, timeout=30).stdout
+        except (OSError, subprocess.SubprocessError):
+            help_text = ""
+        self.safe_mode = "--safe-mode" in help_text
+        if not self.safe_mode:
+            log("[警告] この Claude Code は --safe-mode に対応していません。CLAUDE.md などの中身が相手に漏れる恐れが"
+                "あります。Claude Code を更新してください（claude update）")
         self.panel = Panel(self, args.panel_port)
         DATA_DIR.mkdir(parents=True, exist_ok=True)
         self.record_path = DATA_DIR / f"agent-{self.me}.jsonl"
@@ -627,6 +772,7 @@ class Agent:
         # 参加より前の発言には返事をしない（最初の返答のときに背景として渡す）
         self.replied_upto = self.history[-1]["seq"] if self.history else 0
         log(f"{self.me} としてルーム「{self.room}」に参加しました（ツール: {self.args.tools or 'なし'}）")
+        log(f"Claude が読めるフォルダ: {self.args.workdir}")
         if self.policy_text:
             log(f"代理人モード: 秘密 {len(self.secret_items)} 件・止める言葉 {len(self.words)} 件"
                 f"（チェック: {'なし' if not self.guarded else self.args.guard}）")
@@ -842,6 +988,8 @@ class Agent:
     def _run_claude(self, prompt, system, tools, model=None, resume=None):
         """claude -p を 1 回動かす。部屋が止められたら、その場でプロセスを止めて Stopped。"""
         cmd = [self.claude, "-p", "--output-format", "json", "--tools", tools, "--append-system-prompt", system]
+        if self.safe_mode:
+            cmd.append("--safe-mode")
         if model:
             cmd += ["--model", model]
         if resume:
@@ -894,7 +1042,7 @@ def add_agent_args(p):
     p.add_argument("--tools", default=DEFAULT_TOOLS,
                    help=f'Claude に許すツール（既定 "{DEFAULT_TOOLS}"＝読み取りのみ。"" で無し）')
     p.add_argument("--model", help="Claude のモデル（省略時は Claude Code の既定）")
-    p.add_argument("--workdir", default=os.getcwd(), help="Claude を動かすディレクトリ（既定: 今いる場所）")
+    p.add_argument("--workdir", help="Claude に読ませてよいディレクトリ（既定: ~/.claude-room/work/ の専用の空のフォルダ）")
     p.add_argument("--policy", help="代理人の設定ファイル（目的・秘密・出してよいこと。Markdown）")
     p.add_argument("--guard", choices=["auto", "ask", "off"], default="auto",
                    help="秘密チェックで引っかかったとき: auto=自動で書き直し→だめなら確認（既定） / ask=すぐ確認 / off=チェックしない")
@@ -923,7 +1071,8 @@ def cmd_host(a):
         print(f"  相手への招待URL :  {b}/#key={key}")
         print("  相手の参加コマンド（どちらか）:")
         print(f'    uvx --from git+{REPO_URL} claude-room join "{b}/#key={key}" --name <相手の名前>')
-        print(f"    curl -o claude_room.py {b}/claude_room.py && "
+        raw = REPO_URL.replace("github.com", "raw.githubusercontent.com") + "/main/claude_room.py"
+        print(f"    curl -O {raw} && "
               f'python3 claude_room.py join "{b}/#key={key}" --name <相手の名前>')
     if not public:
         print("  [注意] Tailscale のアドレスが見つからないため、この PC の中からしか開けません")
@@ -1074,7 +1223,7 @@ const REPO='__REPO_URL__';
 const store={get(k){try{return localStorage.getItem('cb.'+k)}catch(e){return null}},set(k,v){try{localStorage.setItem('cb.'+k,v)}catch(e){}}};
 let KEY=new URLSearchParams(location.hash.slice(1)).get('key')||store.get('key')||'';
 let ME=store.get('name')||'';
-let state=null,lastSeq=0,es=null;const seen=new Set();const msgs=[];
+let state=null,lastSeq=0;const seen=new Set();const msgs=[];
 const COLORS=['#c96442','#8a5cf6','#0f9d8a','#d14d72','#b7791f','#3f7fbf','#5f8f2f','#a0522d'];
 function color(n){let h=0;for(const c of n)h=(h*31+c.charCodeAt(0))>>>0;return COLORS[h%COLORS.length]}
 function esc(s){return s.replace(/[&<>"']/g,c=>({'&':'&amp;','<':'&lt;','>':'&gt;','"':'&quot;',"'":'&#39;'}[c]))}
@@ -1139,12 +1288,24 @@ $('#export').onclick=()=>{const md=`# Claude Room / ${state?state.room:''}\n\n`+
   const a=document.createElement('a');a.href=URL.createObjectURL(new Blob([md],{type:'text/markdown'}));a.download=`claude-room-${(state&&state.room)||'log'}.md`;a.click()};
 $('#invite').onclick=()=>{const bases=(state&&state.invite_bases.length)?state.invite_bases:[location.origin];
   $('#inviteBody').innerHTML=bases.map(b=>{const u=`${b}/#key=${KEY}`;return `<p style="margin-bottom:4px"><b>1. 招待URL</b>（ブラウザで開くと、この画面に入れます）</p><pre>${esc(u)}</pre>
-  <p style="margin-bottom:4px"><b>2. 相手の Claude を参加させる</b>（相手の PC で。Python と Claude Code が必要）</p><pre>uvx --from git+${REPO} claude-room join "${esc(u)}" --name &lt;相手の名前&gt;</pre><p style="font-size:13px;color:var(--mute);margin:4px 0">uv がない場合（Python だけで動きます）:</p><pre>curl -o claude_room.py ${esc(b)}/claude_room.py\npython3 claude_room.py join "${esc(u)}" --name &lt;相手の名前&gt;</pre>`}).join('');
+  <p style="margin-bottom:4px"><b>2. 相手の Claude を参加させる</b>（相手の PC で。Python と Claude Code が必要）</p><pre>uvx --from git+${REPO} claude-room join "${esc(u)}" --name &lt;相手の名前&gt;</pre><p style="font-size:13px;color:var(--mute);margin:4px 0">uv がない場合（Python だけで動きます）:</p><pre>curl -O ${REPO.replace('github.com','raw.githubusercontent.com')}/main/claude_room.py\npython3 claude_room.py join "${esc(u)}" --name &lt;相手の名前&gt;</pre><p style="font-size:12px;color:var(--mute)">どちらも GitHub の公開版を使います。ホストの PC からプログラムを受け取ることはありません。</p>`}).join('');
   $('#dlgInvite').showModal()};
-function connect(){if(es)es.close();es=new EventSource(`/api/stream?key=${encodeURIComponent(KEY)}&after=${lastSeq}`);
-  es.addEventListener('msg',e=>addMsg(JSON.parse(e.data)));
-  es.addEventListener('state',e=>{$('#conn').style.color='var(--ok)';$('#conn').title='接続中';setState(JSON.parse(e.data))});
-  es.onerror=()=>{$('#conn').style.color='var(--accent)';$('#conn').title='再接続中…';if(es.readyState===2)setTimeout(connect,3000)}}
+// 鍵を URL に載せないため、EventSource ではなく fetch で受信する（鍵はヘッダーで送る）
+let streamCtl=null;
+function connState(ok){$('#conn').style.color=ok?'var(--ok)':'var(--accent)';$('#conn').title=ok?'接続中':'再接続中…'}
+async function connect(){
+  if(streamCtl)streamCtl.abort();const ctl=new AbortController();streamCtl=ctl;
+  try{
+    const r=await fetch(`/api/stream?after=${lastSeq}`,{headers:{'Authorization':'Bearer '+KEY},signal:ctl.signal});
+    if(r.status===401){KEY='';$('#keyIn').value='';$('#dlgKey').showModal();return}
+    if(!r.ok)throw new Error(String(r.status));
+    const rd=r.body.getReader(),dec=new TextDecoder();let buf='';
+    for(;;){const {value,done}=await rd.read();if(done)break;buf+=dec.decode(value,{stream:true});
+      let i;while((i=buf.indexOf('\n\n'))>=0){const chunk=buf.slice(0,i);buf=buf.slice(i+2);let ev='',data='';
+        for(const line of chunk.split('\n')){if(line.startsWith('event: '))ev=line.slice(7);else if(line.startsWith('data: '))data+=line.slice(6)}
+        if(ev==='msg')addMsg(JSON.parse(data));else if(ev==='state'){connState(true);setState(JSON.parse(data))}}}
+  }catch(e){if(ctl.signal.aborted)return}
+  if(streamCtl!==ctl)return;connState(false);setTimeout(connect,3000)}
 async function start(){
   if(!KEY)return $('#dlgKey').showModal();
   try{const r=await api('/api/messages?after=0');store.set('key',KEY);r.messages.forEach(addMsg);setState(r.state);toBottom();connect()}
