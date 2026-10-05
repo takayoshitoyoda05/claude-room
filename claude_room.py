@@ -11,6 +11,7 @@
 """
 import argparse
 import getpass
+import hashlib
 import json
 import os
 import re
@@ -76,6 +77,7 @@ class Room:
         self.viewers = 0
         self.version = 0
         self.invite_bases = []
+        self.host_name = ""
         if log_path.exists():
             with open(log_path, encoding="utf-8") as f:
                 for line in f:
@@ -140,6 +142,15 @@ class Room:
                     self._bump()
         if is_new:
             self.post("system", "system", f"{name}（{owner} の {PRODUCT.get(product, 'AI')}）が参加しました")
+
+    def kick(self, names):
+        """招待を取り消した人の AI を、部屋から外す。"""
+        with self.cond:
+            for n in names:
+                self.agents.pop(n, None)
+                if self.floor and self.floor[0] == n:
+                    self.floor = None
+            self._bump()
 
     def set_status(self, name, status):
         with self.cond:
@@ -264,7 +275,82 @@ class HardenedServer(ThreadingHTTPServer):
             log(f"[警告] 鍵の間違いが続いています（送信元 {ip}）。しばらく断ります")
 
 
-def make_handler(room, key):
+def _sha256(text):
+    return hashlib.sha256(text.encode()).hexdigest()
+
+
+class Invites:
+    """相手ごとの招待。招待の鍵そのものは保存せず、SHA-256 だけを保存する（招待 URL は作成時に 1 回だけ表示）。"""
+
+    def __init__(self, path):
+        self.path = path
+        self.lock = threading.Lock()
+        self.items = []
+        if path.exists():
+            try:
+                self.items = json.loads(path.read_text(encoding="utf-8"))
+            except ValueError:
+                log(f"[警告] {path} を読めません。招待を空から始めます")
+
+    def _save(self):
+        tmp = self.path.with_suffix(".tmp")
+        tmp.write_text(json.dumps(self.items, ensure_ascii=False, indent=1), encoding="utf-8")
+        try:
+            tmp.chmod(0o600)
+        except OSError:
+            pass
+        tmp.replace(self.path)
+
+    def create(self, name):
+        if not NAME_RE.fullmatch(name) or name == "system":
+            raise ValueError("名前に使えるのは、文字・数字・- _ . の 40 文字までです")
+        with self.lock:
+            if any(i["name"] == name and not i["revoked"] for i in self.items):
+                raise ValueError(f"{name} への招待は、すでにあります（作り直すなら、先に取り消してください）")
+            key = secrets.token_urlsafe(24)
+            item = {"id": secrets.token_hex(4), "name": name, "hash": _sha256(key),
+                    "created": time.time(), "revoked": None}
+            self.items.append(item)
+            self._save()
+        return self.public(item), key
+
+    def find(self, key):
+        h = _sha256(key)
+        with self.lock:
+            for i in self.items:
+                if not i["revoked"] and secrets.compare_digest(i["hash"], h):
+                    return dict(i)
+        return None
+
+    def is_active(self, ident):
+        with self.lock:
+            return any(i["id"] == ident and not i["revoked"] for i in self.items)
+
+    def revoke(self, ident):
+        """id か名前（有効な招待）で取り消す。取り消した招待を返す。"""
+        with self.lock:
+            for i in self.items:
+                if not i["revoked"] and ident in (i["id"], i["name"]):
+                    i["revoked"] = time.time()
+                    self._save()
+                    return self.public(i)
+        return None
+
+    @staticmethod
+    def public(i):
+        return {k: i[k] for k in ("id", "name", "created", "revoked")}
+
+    def listing(self):
+        with self.lock:
+            return [self.public(i) for i in self.items]
+
+
+def guest_names(name):
+    """招待された人が名乗ってよい名前（本人と、その人の AI）。"""
+    return {name} | {f"{p}-{name}" for p in AI_KINDS}
+
+
+def make_handler(room, key, invites):
     class Handler(BaseHTTPRequestHandler):
         server_version = "claude-room"
         sys_version = ""
@@ -285,10 +371,18 @@ def make_handler(room, key):
             self._send(code, json.dumps(obj, ensure_ascii=False).encode(), "application/json; charset=utf-8")
 
         def _authed(self):
-            """鍵はヘッダーでだけ受け取る（URL に載せると、記録や履歴に残りうるため）。"""
+            """鍵はヘッダーでだけ受け取る（URL に載せると、記録や履歴に残りうるため）。
+
+            ホストの鍵なら self.who = {"role": "host"}、招待の鍵なら {"role": "guest", "name", "id"}。
+            """
             got = self.headers.get("Authorization", "")
-            ok = got.startswith("Bearer ") and secrets.compare_digest(got[7:].encode(), key.encode())
-            if ok:
+            got = got[7:] if got.startswith("Bearer ") else ""
+            if got and secrets.compare_digest(got.encode(), key.encode()):
+                self.who = {"role": "host", "name": room.host_name}
+                return True
+            inv = invites.find(got) if got else None
+            if inv:
+                self.who = {"role": "guest", "name": inv["name"], "id": inv["id"]}
                 return True
             ip = self.client_address[0]
             if self.server.too_many_fails(ip):
@@ -297,6 +391,10 @@ def make_handler(room, key):
                 self.server.record_fail(ip)
                 self._json(401, {"error": "bad key"})
             return False
+
+        def _may_act_as(self, name):
+            """招待された人は、自分と自分の AI の名前でしか、発言・操作できない（なりすまし防止）。"""
+            return self.who["role"] == "host" or name in guest_names(self.who["name"])
 
         def _body(self):
             n = int(self.headers.get("Content-Length") or 0)
@@ -320,6 +418,13 @@ def make_handler(room, key):
             if not self._authed():
                 return
             after = int(qs.get("after", ["0"])[0])
+            if u.path == "/api/me":
+                return self._json(200, self.who if self.who["role"] == "host"
+                                  else {"role": "guest", "name": self.who["name"]})
+            if u.path == "/api/invites":
+                if self.who["role"] != "host":
+                    return self._json(403, {"error": "host only"})
+                return self._json(200, {"invites": invites.listing(), "bases": room.invite_bases})
             if u.path == "/api/messages":
                 with room.cond:
                     return self._json(200, {"messages": room.since(after), "state": room.state()})
@@ -328,6 +433,8 @@ def make_handler(room, key):
                 if name:
                     if not (NAME_RE.fullmatch(name) and NAME_RE.fullmatch(owner)):
                         return self._json(400, {"error": "bad name"})
+                    if not (self._may_act_as(name) and self._may_act_as(owner)):
+                        return self._json(403, {"error": "この招待では、その名前を使えません"})
                     product = qs.get("agent", ["claude"])[0]
                     room.heartbeat(name, owner, product if product in AI_KINDS else "claude")
                 v = int(qs.get("v", ["-1"])[0])
@@ -364,6 +471,8 @@ def make_handler(room, key):
             v = -1
             try:
                 while True:
+                    if self.who["role"] == "guest" and not invites.is_active(self.who["id"]):
+                        break   # 招待が取り消されたら、その場で切る
                     with room.cond:
                         room.cond.wait_for(lambda: room.version != v, timeout=15)
                         msgs, st, v = room.since(after), room.state(), room.version
@@ -398,8 +507,12 @@ def make_handler(room, key):
             if not isinstance(d, dict):
                 return self._json(400, {"error": "bad body"})
             name = str(d.get("name") or d.get("by") or "").strip()
+            if u.path.startswith("/api/invites"):
+                return self._invites(u.path, d)
             if name and not NAME_RE.fullmatch(name):
                 return self._json(400, {"error": "名前に使えるのは、文字・数字・- _ . の 40 文字までです"})
+            if name and not self._may_act_as(name):
+                return self._json(403, {"error": "この招待では、その名前を使えません"})
             if u.path == "/api/send":
                 text = str(d.get("text") or "").strip()
                 kind = d.get("kind") if d.get("kind") in ("human",) + AI_KINDS else "human"
@@ -426,7 +539,7 @@ def make_handler(room, key):
                                      else f"AI の連続発言の上限を {room.max_turns} 回にしました")
                     room._bump()
                 for n in notes:
-                    room.post("system", "system", f"{name or '誰か'}が{n}")
+                    room.post("system", "system", f"{name or self.who.get('name') or '誰か'}が{n}")
                 with room.cond:
                     return self._json(200, room.state())
             if u.path == "/api/floor":
@@ -443,14 +556,32 @@ def make_handler(room, key):
                 return self._json(200, {"ok": True})
             self._json(404, {"error": "not found"})
 
+        def _invites(self, path, d):
+            if self.who["role"] != "host":
+                return self._json(403, {"error": "招待を作ったり取り消したりできるのは、ホストだけです"})
+            if path == "/api/invites":
+                try:
+                    item, inv_key = invites.create(str(d.get("name") or "").strip())
+                except ValueError as e:
+                    return self._json(400, {"error": str(e)})
+                return self._json(200, {"invite": item, "key": inv_key, "bases": room.invite_bases})
+            if path == "/api/invites/revoke":
+                item = invites.revoke(str(d.get("id") or d.get("name") or ""))
+                if not item:
+                    return self._json(404, {"error": "その招待は見つからないか、すでに取り消されています"})
+                room.kick(guest_names(item["name"]))
+                room.post("system", "system", f"{item['name']} の招待を取り消しました")
+                return self._json(200, {"invite": item})
+            return self._json(404, {"error": "not found"})
+
     return Handler
 
 
-def serve(room, key, binds, port):
+def serve(room, key, invites, binds, port):
     servers = []
     for host in binds:
         try:
-            srv = HardenedServer((host, port), make_handler(room, key))
+            srv = HardenedServer((host, port), make_handler(room, key, invites))
         except OSError as e:
             log(f"[警告] {host}:{port} で待ち受けできません: {e}")
             continue
@@ -914,6 +1045,11 @@ class Agent:
                 last = self.history[-1]["seq"] if self.history else 0
                 st = self._absorb(self.api("GET", f"/api/wait?after={last}&v={self.v}&timeout=25{q}", timeout=60))
                 self.maybe_reply(st)
+            except urllib.error.HTTPError as e:
+                if e.code in (401, 403):
+                    sys.exit(f"部屋から外されました（招待が取り消されたか、鍵が無効になりました）: {_http_error(e)}")
+                log(f"[接続エラー] {e}  3 秒後に再接続します")
+                time.sleep(3)
             except (OSError, ValueError) as e:
                 log(f"[接続エラー] {e}  3 秒後に再接続します")
                 time.sleep(3)
@@ -1208,7 +1344,8 @@ class Agent:
 # ---------------------------------------------------------------- cli
 
 def add_agent_args(p):
-    p.add_argument("--name", default=getpass.getuser(), help="あなたの名前（AI は claude-<名前> / codex-<名前> になる）")
+    p.add_argument("--name", default=getpass.getuser(),
+                   help="あなたの名前（AI は claude-<名前> / codex-<名前> になる）。join では招待の名前が使われる")
     p.add_argument("--agent", choices=AI_KINDS, default="claude",
                    help="部屋に参加させる AI: claude（Claude Code、既定）/ codex（OpenAI Codex CLI）")
     p.add_argument("--tools", default=None,
@@ -1225,42 +1362,60 @@ def add_agent_args(p):
     p.add_argument("--timeout", type=int, default=900, help="1 回の返答の制限時間（秒）")
 
 
+def print_invite(base, inv_key, name):
+    url = f"{base}/#key={inv_key}"
+    raw = REPO_URL.replace("github.com", "raw.githubusercontent.com") + "/main/claude_room.py"
+    print(f"  {name} さんへの招待URL :  {url}")
+    print("    参加コマンド（どちらか。Codex で参加するなら、末尾に --agent codex）:")
+    print(f'      uvx --from git+{REPO_URL} claude-room join "{url}"')
+    print(f'      curl -O {raw} && python3 claude_room.py join "{url}"')
+
+
 def cmd_host(a):
     key = load_key(a.new_key)
     log_path = DATA_DIR / f"{a.room}.jsonl"
     if a.fresh and log_path.exists():
         log_path.rename(log_path.with_name(f"{a.room}-{time.strftime('%Y%m%d-%H%M%S')}.jsonl"))
+    if not NAME_RE.fullmatch(a.name):
+        sys.exit("名前に使えるのは、文字・数字・- _ . の 40 文字までです")
     room = Room(a.room, log_path, a.max_turns)
+    room.host_name = a.name
+    invites = Invites(DATA_DIR / "invites.json")
     if a.public:
         # 公開するときは 127.0.0.1 だけで待ち受け、Funnel 経由でだけ外から届くようにする
-        up = serve(room, key, ["127.0.0.1"], a.port)
+        up = serve(room, key, invites, ["127.0.0.1"], a.port)
         room.invite_bases = [start_funnel(a.port, a.public_port)]
         public = room.invite_bases
     else:
         binds = a.bind or [b for b in (tailscale_ip(), "127.0.0.1") if b]
-        up = serve(room, key, binds, a.port)
+        up = serve(room, key, invites, binds, a.port)
         public = [h for h in up if not h.startswith("127.")]
         room.invite_bases = [f"http://{h}:{a.port}" for h in public]
 
     print()
-    print(f"  Claude Room   ルーム「{a.room}」")
+    print(f"  Claude Room   ルーム「{a.room}」   ホスト: {a.name}")
     print(f"  自分のブラウザ :  http://localhost:{a.port}/#key={key}")
-    for b in room.invite_bases:
-        print(f"  相手への招待URL :  {b}/#key={key}")
-        print("  相手の参加コマンド（どちらか）:")
-        print(f'    uvx --from git+{REPO_URL} claude-room join "{b}/#key={key}" --name <相手の名前>')
-        raw = REPO_URL.replace("github.com", "raw.githubusercontent.com") + "/main/claude_room.py"
-        print(f"    curl -O {raw} && "
-              f'python3 claude_room.py join "{b}/#key={key}" --name <相手の名前>')
+    print("  ※ これはホストの鍵です。人には渡さないでください")
+    print()
+    base = (room.invite_bases or [f"http://localhost:{a.port}"])[0]
+    for name in a.invite or []:
+        try:
+            _, inv_key = invites.create(name)
+            print_invite(base, inv_key, name)
+        except ValueError as e:
+            print(f"  [{name}] {e}")
+    active = [i["name"] for i in invites.listing() if not i["revoked"]]
+    if active:
+        print(f"  有効な招待: {', '.join(active)}")
+    print("  相手を招待する: ブラウザの「招待」ボタン、または  claude-room invite <相手の名前>")
+    print("  招待を取り消す: ブラウザの「招待」ボタン、または  claude-room invite --revoke <相手の名前>")
     if not public:
         print("  [注意] Tailscale のアドレスが見つからないため、この PC の中からしか開けません")
         print("         相手を入れるには、--bind <この PC のアドレス> で待ち受けるアドレスを指定してください")
-    print("  ※ 相手が Codex で参加するときは、参加コマンドの末尾に --agent codex を付けます")
-    print("  ※ 招待URLは鍵そのもの。信頼できる相手にだけ、1 対 1 で渡してください")
     if a.public:
         print("  ※ インターネットに公開中です（Tailscale Funnel）。相手は Tailscale なしで入れます")
         print("     この部屋を閉じると（Ctrl+C）、公開も止まります")
-    print()
+    print(flush=True)
 
     if a.no_claude:
         log("自分の AI は参加させずに、部屋だけ開きました（Ctrl+C で終了）")
@@ -1269,18 +1424,74 @@ def cmd_host(a):
     Agent(f"http://{up[0]}:{a.port}", key, a.name, a).run()
 
 
+def _get_json(url, key, data=None):
+    req = urllib.request.Request(url, method="POST" if data is not None else "GET",
+                                 data=json.dumps(data).encode() if data is not None else None,
+                                 headers={"Authorization": "Bearer " + key, "Content-Type": "application/json"})
+    with urllib.request.urlopen(req, timeout=15) as r:
+        return json.loads(r.read())
+
+
+def _http_error(e):
+    try:
+        return json.loads(e.read()).get("error") or str(e)
+    except (ValueError, OSError):
+        return str(e)
+
+
 def cmd_join(a):
     u = urlparse(a.url)
     key = a.key or parse_qs(u.fragment).get("key", [""])[0] or parse_qs(u.query).get("key", [""])[0]
     if not key:
         sys.exit("URL に #key=... が含まれていません（招待URLをそのまま貼ってください）")
     base = f"{u.scheme}://{u.netloc}"
+    try:
+        me = _get_json(base + "/api/me", key)
+    except urllib.error.HTTPError as e:
+        sys.exit("この招待は使えません（取り消されたか、URL が違います）" if e.code == 401 else f"接続できません: {e}")
+    except OSError as e:
+        sys.exit(f"接続できません: {e}\n  （ネットワークがつながっているか、URL が正しいかを確かめてください）")
+    name = a.name or getpass.getuser()
+    if me.get("role") == "guest":
+        if a.name and a.name != me["name"]:
+            log(f"[注意] この招待は {me['name']} さん用なので、{me['name']} として参加します")
+        name = me["name"]
     print(f"\n  ブラウザで会話を見る:  {base}/#key={key}\n", flush=True)
-    Agent(base, key, a.name, a).run()
+    Agent(base, key, name, a).run()
+
+
+def cmd_invite(a):
+    path = DATA_DIR / "key"
+    if not path.exists():
+        sys.exit("ホストの鍵がありません。この PC で claude-room host を動かしてから使ってください")
+    key = path.read_text().strip()
+    base = f"http://127.0.0.1:{a.port}"
+    try:
+        if a.revoke:
+            r = _get_json(base + "/api/invites/revoke", key, {"name": a.revoke})
+            print(f"{r['invite']['name']} さんの招待を取り消しました（その人の接続は、すぐに切れます）")
+            return
+        if a.list or not a.name:
+            r = _get_json(base + "/api/invites", key)
+            if not r["invites"]:
+                print("招待はまだありません（claude-room invite <相手の名前> で作れます）")
+            for i in r["invites"]:
+                when = time.strftime("%m/%d %H:%M", time.localtime(i["created"]))
+                state = "取り消し済み" if i["revoked"] else "有効"
+                print(f"  {i['name']:<20} {state:<8} 作成 {when}")
+            return
+        r = _get_json(base + "/api/invites", key, {"name": a.name})
+        print()
+        print_invite((r.get("bases") or [f"http://localhost:{a.port}"])[0], r["key"], a.name)
+        print("\n  ※ 招待URLは、いまだけ表示します。保存はしていません（なくしたら、取り消して作り直します）\n")
+    except urllib.error.HTTPError as e:
+        sys.exit(_http_error(e))
+    except OSError:
+        sys.exit(f"部屋が開いていません（この PC で claude-room host を動かしてから使ってください。ポート {a.port}）")
 
 
 def main():
-    ap = argparse.ArgumentParser(prog="claude-room", description="自分の Claude と相手の Claude を 1 つの部屋で会話させる（GUI つき）")
+    ap = argparse.ArgumentParser(prog="claude-room", description="自分の AI と相手の AI を 1 つの部屋で会話させる（GUI つき）")
     ap.add_argument("--version", action="version", version=f"claude-room {__version__}")
     sub = ap.add_subparsers(dest="cmd", required=True)
     h = sub.add_parser("host", help="部屋を開く（この PC が中継役）")
@@ -1295,14 +1506,21 @@ def main():
     h.add_argument("--public-port", type=int, choices=[443, 8443, 10000], default=443,
                    help="公開に使う HTTPS のポート（Funnel が使えるのは 443・8443・10000）")
     h.add_argument("--no-claude", "--no-ai", dest="no_claude", action="store_true", help="自分の AI は参加させない")
-    h.add_argument("--new-key", action="store_true", help="鍵を作り直す（古い招待URLは使えなくなる）")
+    h.add_argument("--new-key", action="store_true", help="ホストの鍵を作り直す（相手ごとの招待は、そのまま使える）")
     h.add_argument("--fresh", action="store_true", help="これまでのログを退避して、空の部屋から始める")
     h.set_defaults(func=cmd_host)
+    h.add_argument("--invite", action="append", metavar="NAME", help="起動と同時に、この人への招待を作る（何回でも指定できる）")
     j = sub.add_parser("join", help="招待URLで部屋に入る")
     j.add_argument("url")
     j.add_argument("--key", help=argparse.SUPPRESS)
     add_agent_args(j)
-    j.set_defaults(func=cmd_join)
+    j.set_defaults(func=cmd_join, name=None)
+    v = sub.add_parser("invite", help="相手ごとの招待を作る・一覧を見る・取り消す（部屋を開いている PC で）")
+    v.add_argument("name", nargs="?", help="招待する相手の名前")
+    v.add_argument("--list", action="store_true", help="招待の一覧を見る")
+    v.add_argument("--revoke", metavar="NAME", help="この人の招待を取り消す")
+    v.add_argument("--port", type=int, default=8765, help="部屋のポート（host で --port を変えたとき）")
+    v.set_defaults(func=cmd_invite)
     a = ap.parse_args()
     try:
         a.func(a)
@@ -1373,6 +1591,10 @@ dialog::backdrop{background:rgba(0,0,0,.35)}
 dialog input{width:100%;font:inherit;padding:8px 10px;border:1px solid var(--line);border-radius:8px;background:var(--bg);color:var(--ink)}
 dialog pre{background:var(--bg);border:1px solid var(--line);border-radius:8px;padding:10px;white-space:pre-wrap;word-break:break-all;font-size:12px}
 .row{display:flex;gap:8px;justify-content:flex-end;margin-top:12px}
+.invrow{display:flex;gap:8px}.invrow input{flex:1}
+.invitem{display:flex;gap:10px;align-items:center;padding:6px 0;border-top:1px solid var(--line);font-size:14px;flex-wrap:wrap}
+.invitem span{color:var(--mute);font-size:12px;flex:1}.invitem .gone{text-decoration:line-through;color:var(--mute)}
+dialog pre{user-select:all}.btn.del{color:#c0392b}
 .conn{font-size:12px;color:var(--mute)}
 @media (max-width:600px){header{padding:8px 12px}main{padding:12px}footer{padding:8px 12px}.ctrl .lbl,.ctrl .meter{display:none}.chips{order:3;flex-basis:100%}.chip{max-width:100%;overflow:hidden}}
 </style></head>
@@ -1401,8 +1623,11 @@ dialog pre{background:var(--bg);border:1px solid var(--line);border-radius:8px;p
   <p style="color:var(--mute);font-size:13px;margin-top:0">招待URL（#key= を含むもの）をそのまま開くか、鍵を貼ってください</p>
   <input id="keyIn" required><div class="row"><button class="btn primary">開く</button></div></form></dialog>
 <dialog id="dlgInvite"><h3 style="margin-top:0">相手を招待する</h3>
-  <p style="font-size:13px;color:var(--mute)">招待URLは鍵そのものです。信頼できる相手にだけ、1 対 1 で渡してください。</p>
-  <div id="inviteBody"></div><div class="row"><button class="btn" onclick="this.closest('dialog').close()">閉じる</button></div></dialog>
+  <p style="font-size:13px;color:var(--mute);margin-top:0">相手ごとに招待を作ります。招待は名前と結びつき、その人は自分と自分の AI の名前でしか発言できません。いつでも 1 人ずつ取り消せます。</p>
+  <div class="invrow"><input id="invName" maxlength="40" placeholder="相手の名前（例: bob）"><button class="btn primary" id="invCreate">招待を作る</button></div>
+  <div id="invResult"></div>
+  <h4 style="margin:16px 0 6px">発行した招待</h4><div id="invList"></div>
+  <div class="row"><button class="btn" onclick="this.closest('dialog').close()">閉じる</button></div></dialog>
 <script>
 const $=s=>document.querySelector(s);
 const REPO='__REPO_URL__';
@@ -1410,7 +1635,7 @@ const PRODUCT={claude:'Claude',codex:'Codex'};
 const store={get(k){try{return localStorage.getItem('cb.'+k)}catch(e){return null}},set(k,v){try{localStorage.setItem('cb.'+k,v)}catch(e){}}};
 let KEY=new URLSearchParams(location.hash.slice(1)).get('key')||store.get('key')||'';
 let ME=store.get('name')||'';
-let state=null,lastSeq=0;const seen=new Set();const msgs=[];
+let state=null,lastSeq=0,ROLE='';const seen=new Set();const msgs=[];
 const COLORS=['#c96442','#8a5cf6','#0f9d8a','#d14d72','#b7791f','#3f7fbf','#5f8f2f','#a0522d'];
 function color(n){let h=0;for(const c of n)h=(h*31+c.charCodeAt(0))>>>0;return COLORS[h%COLORS.length]}
 function esc(s){return s.replace(/[&<>"']/g,c=>({'&':'&amp;','<':'&lt;','>':'&gt;','"':'&quot;',"'":'&#39;'}[c]))}
@@ -1473,10 +1698,19 @@ $('#pause').onclick=()=>state&&control({paused:!state.paused});
 document.addEventListener('keydown',e=>{if(e.key==='Escape'&&state&&!state.paused&&!document.querySelector('dialog[open]')){e.preventDefault();control({paused:true})}});
 $('#export').onclick=()=>{const md=`# Claude Room / ${state?state.room:''}\n\n`+msgs.map(m=>m.kind==='system'?`> ${m.text}\n`:`### ${m.name}（${PRODUCT[m.kind]||'人間'}） ${new Date(m.ts*1000).toLocaleString('ja-JP')}\n\n${m.text}\n`).join('\n');
   const a=document.createElement('a');a.href=URL.createObjectURL(new Blob([md],{type:'text/markdown'}));a.download=`claude-room-${(state&&state.room)||'log'}.md`;a.click()};
-$('#invite').onclick=()=>{const bases=(state&&state.invite_bases.length)?state.invite_bases:[location.origin];
-  $('#inviteBody').innerHTML=bases.map(b=>{const u=`${b}/#key=${KEY}`;return `<p style="margin-bottom:4px"><b>1. 招待URL</b>（ブラウザで開くと、この画面に入れます）</p><pre>${esc(u)}</pre>
-  <p style="margin-bottom:4px"><b>2. 相手の AI を参加させる</b>（相手の PC で。Python と、Claude Code か Codex が必要）</p><pre>uvx --from git+${REPO} claude-room join "${esc(u)}" --name &lt;相手の名前&gt;</pre><p style="font-size:13px;color:var(--mute);margin:4px 0">uv がない場合（Python だけで動きます）:</p><pre>curl -O ${REPO.replace('github.com','raw.githubusercontent.com')}/main/claude_room.py\npython3 claude_room.py join "${esc(u)}" --name &lt;相手の名前&gt;</pre><p style="font-size:12px;color:var(--mute)">Codex で参加するときは、末尾に <code>--agent codex</code> を付けます。どちらも GitHub の公開版を使います。ホストの PC からプログラムを受け取ることはありません。</p>`}).join('');
-  $('#dlgInvite').showModal()};
+function inviteHtml(base,key,name){const u=`${base}/#key=${key}`,raw=REPO.replace('github.com','raw.githubusercontent.com')+'/main/claude_room.py';
+  return `<p style="margin-bottom:4px"><b>${esc(name)} さんへの招待URL</b>（<b>いまだけ表示します</b>。コピーして、1 対 1 で渡してください）</p><pre>${esc(u)}</pre>
+  <p style="margin-bottom:4px">相手の AI を参加させる（相手の PC で。Python と、Claude Code か Codex が必要）:</p><pre>uvx --from git+${esc(REPO)} claude-room join "${esc(u)}"</pre>
+  <p style="font-size:13px;color:var(--mute);margin:4px 0">uv がない場合（Python だけで動きます）:</p><pre>curl -O ${esc(raw)}\npython3 claude_room.py join "${esc(u)}"</pre>
+  <p style="font-size:12px;color:var(--mute)">Codex で参加するときは、末尾に <code>--agent codex</code> を付けます。どちらも GitHub の公開版を使い、ホストの PC からプログラムを受け取ることはありません。</p>`}
+async function loadInvites(){const r=await api('/api/invites');
+  $('#invList').innerHTML=r.invites.length?r.invites.slice().reverse().map(i=>`<div class="invitem"><b class="${i.revoked?'gone':''}">${esc(i.name)}</b><span>${i.revoked?'取り消し済み':'有効'} ・ 作成 ${new Date(i.created*1000).toLocaleString('ja-JP')}</span>${i.revoked?'':`<button class="btn del" data-rv="${esc(i.id)}" data-nm="${esc(i.name)}">取り消す</button>`}</div>`).join(''):'<p style="color:var(--mute);font-size:13px">まだありません</p>';
+  document.querySelectorAll('[data-rv]').forEach(b=>b.onclick=async()=>{if(!confirm(`${b.dataset.nm} さんの招待を取り消しますか？その人の接続は、すぐに切れます`))return;
+    const r=await api('/api/invites/revoke',{id:b.dataset.rv});if(r.error)alert(r.error);loadInvites()})}
+$('#invite').onclick=async()=>{$('#invResult').innerHTML='';$('#invName').value='';try{await loadInvites()}catch(e){return}$('#dlgInvite').showModal()};
+$('#invCreate').onclick=async()=>{const name=$('#invName').value.trim();if(!name)return;
+  const r=await api('/api/invites',{name});if(r.error){alert(r.error);return}
+  $('#invResult').innerHTML=inviteHtml((r.bases&&r.bases[0])||location.origin,r.key,r.invite.name);$('#invName').value='';loadInvites()};
 // 鍵を URL に載せないため、EventSource ではなく fetch で受信する（鍵はヘッダーで送る）
 let streamCtl=null;
 function connState(ok){$('#conn').style.color=ok?'var(--ok)':'var(--accent)';$('#conn').title=ok?'接続中':'再接続中…'}
@@ -1495,7 +1729,10 @@ async function connect(){
   if(streamCtl!==ctl)return;connState(false);setTimeout(connect,3000)}
 async function start(){
   if(!KEY)return $('#dlgKey').showModal();
-  try{const r=await api('/api/messages?after=0');store.set('key',KEY);r.messages.forEach(addMsg);setState(r.state);toBottom();connect()}
+  try{const r=await api('/api/messages?after=0');store.set('key',KEY);r.messages.forEach(addMsg);setState(r.state);toBottom();connect();
+    const me=await api('/api/me');ROLE=me.role;
+    if(me.name){ME=me.name;store.set('name',ME);$('#rename').style.display='none'}   // 名前は鍵で決まる
+    if(ROLE!=='host')$('#invite').style.display='none'}
   catch(e){if(e.message==='401'){KEY='';$('#keyIn').value='';$('#dlgKey').showModal()}else setTimeout(start,3000)}
   $('#me').textContent=ME||'（未設定）';if(!ME)askName();
 }
