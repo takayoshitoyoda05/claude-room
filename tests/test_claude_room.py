@@ -7,7 +7,6 @@ import json
 import os
 import re
 import shutil
-import stat
 import subprocess
 import socket
 import sys
@@ -551,6 +550,31 @@ class PublicModeTests(unittest.TestCase):
         codes = [call(base, "/api/messages", "wrong", headers={"X-Forwarded-For": f"10.0.0.{i}"})[0]
                  for i in range(cr.FAIL_LIMIT + 2)]
         self.assertEqual(codes[-1], 429)                       # ヘッダーを変えても、締め出しを逃れられない
+
+    def test_source_tables_stay_bounded(self):
+        base = self._server(True)
+        srv_tables = []
+        import gc
+        for o in gc.get_objects():
+            if isinstance(o, cr.HardenedServer) and f":{o.server_address[1]}" in base:
+                srv_tables.append(o)
+        srv = srv_tables[0]
+        for i in range(25000):                                   # 多数の送信元からの要求
+            srv.rate_ok(f"198.51.{i // 256}.{i % 256}", "anon")
+            srv.record_fail(f"203.0.{i // 256}.{i % 256}")
+        self.assertLess(len(srv._posts), 21000)
+        self.assertLess(len(srv._fails), 21000)
+
+    @unittest.skipUnless(POSIX, "POSIX のプロセス確認")
+    def test_cleanup_stale_codex_homes(self):
+        root = Path(tempfile.mkdtemp(dir=_TMP))
+        dead = subprocess.Popen([sys.executable, "-c", "pass"])
+        dead.wait()
+        (root / f"codex-bob-{dead.pid}-abc").mkdir()
+        (root / f"codex-bob-{os.getpid()}-def").mkdir()
+        (root / "unrelated").mkdir()
+        cr._cleanup_stale(root)
+        self.assertEqual(sorted(p.name for p in root.iterdir()), [f"codex-bob-{os.getpid()}-def", "unrelated"])
 
     def test_anonymous_page_rate_limit(self):
         base = self._server(True)

@@ -33,7 +33,7 @@ from http.server import BaseHTTPRequestHandler, ThreadingHTTPServer
 from pathlib import Path
 from urllib.parse import parse_qs, quote, urlparse
 
-__version__ = "0.2.0"
+__version__ = "0.3.0"
 REPO_URL = "https://github.com/takayoshitoyoda05/claude-room"
 DATA_DIR = Path(os.environ.get("CLAUDE_ROOM_HOME", Path.home() / ".claude-room"))
 MAX_TEXT = 20000
@@ -404,6 +404,7 @@ class HardenedServer(ThreadingHTTPServer):
         self._fails = {}             # 送信元 -> 鍵を間違えた時刻のリスト
         self._posts = {}             # (種類, 投稿した人) -> 時刻のリスト
         self._stream_by = {}         # 招待の ID か host -> 待ち受けの本数
+        self._pruned = [0.0, 0.0]    # 表の掃除をした時刻（鍵の間違い・回数の記録）
         self._warned = 0.0
         threading.Thread(target=self._reaper, daemon=True).start()
 
@@ -487,8 +488,11 @@ class HardenedServer(ThreadingHTTPServer):
             if ok:
                 recent.append(now)
             self._posts[k] = recent
-            if len(self._posts) > 1000:
+            if len(self._posts) > 1000 and now - self._pruned[1] > 1:
+                self._pruned[1] = now
                 self._posts = {k: v for k, v in self._posts.items() if v and now - v[-1] < 60}
+            if len(self._posts) > 20000:         # 多数の送信元からの攻撃でも、表を大きくしすぎない
+                self._posts = {k: v for k, v in self._posts.items() if k[0] != "anon"}
             return ok
 
     def too_many_fails(self, ip):
@@ -502,8 +506,11 @@ class HardenedServer(ThreadingHTTPServer):
         with self._lock:
             now = time.time()
             self._fails.setdefault(ip, []).append(now)
-            if len(self._fails) > 1000:          # 送信元が多すぎるときは古い記録を捨てる
+            if len(self._fails) > 1000 and now - self._pruned[0] > 1:   # 古い記録を捨てる（1 秒に 1 回まで）
+                self._pruned[0] = now
                 self._fails = {k: v for k, v in self._fails.items() if v and now - v[-1] < FAIL_WINDOW}
+            if len(self._fails) > 20000:         # それでも多すぎる（多数の送信元からの攻撃）なら、表を作り直す
+                self._fails = {ip: self._fails[ip]}
             warn = len(self._fails[ip]) >= FAIL_LIMIT and now - self._warned > 60
             if warn:
                 self._warned = now
@@ -1983,8 +1990,14 @@ def _cleanup_stale(root):
     """強制終了などで残った、持ち主のプロセスがもういない Codex の設定フォルダを消す。"""
     for d in root.iterdir():
         try:
+            if os.name != "posix":
+                # Windows の os.kill(pid, 0) は、確かめるのではなくプロセスを止めてしまうので使わない。
+                # 代わりに、1 日より古いものだけを消す
+                if time.time() - d.stat().st_mtime > 86400:
+                    shutil.rmtree(str(d), ignore_errors=True)
+                continue
             pid = int(d.name.rsplit("-", 2)[-2])
-            os.kill(pid, 0)
+            os.kill(pid, 0)              # POSIX では、プロセスがいるかを確かめるだけ
         except (ValueError, IndexError):
             continue
         except ProcessLookupError:
