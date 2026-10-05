@@ -842,6 +842,23 @@ class SecretCheckTests(unittest.TestCase):
             self.assertFalse(v["ok"], bad)
             self.assertEqual(v["by"], "error", bad)
 
+    def test_pass_on_direct_mention_is_rechecked(self):
+        ag = self._agent('{"leak": false}')
+        ag.guarded, ag.session, ag.owner = False, "s", "alice"
+        ag.args = argparse.Namespace(check_model=None, model=None, confirm=False, guard="auto", max_rewrites=2)
+        ag.keep_floor = lambda: True
+        ag.panel = argparse.Namespace(step=lambda *a, **k: None, set=lambda *a, **k: None)
+        answers = iter([cr.PASS_TOKEN, "はい、お答えします。"])
+        asked = []
+        ag.ask_ai = lambda prompt: asked.append(prompt) or next(answers)
+        talk = [{"seq": 1, "ts": 0, "name": "claude-bob", "kind": "claude", "text": "@claude-alice 状態を教えてください"}]
+        self.assertEqual(ag.compose({}, talk), "はい、お答えします。")
+        self.assertEqual(len(asked), 2)
+        # 名指しでなければ、黙るのをそのまま認める
+        ag.ask_ai = lambda prompt: cr.PASS_TOKEN
+        talk[0]["text"] = "みなさん、よろしく"
+        self.assertEqual(ag.compose({}, talk), cr.PASS_TOKEN)
+
     def test_stop_words_first(self):
         ag = self._agent('{"leak": false}')
         ag.words = ["6万"]

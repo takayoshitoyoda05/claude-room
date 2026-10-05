@@ -1683,6 +1683,12 @@ class Agent:
         draft = self.ask_ai(self.build_prompt(talk))
         n = 1
         self.panel.step(turn, kind="draft", n=n, text=draft)
+        # 名指し（@自分の名前）で話しかけられたのに黙ろうとしたら、一度だけ確かめる（会話が理由なく止まらないように）
+        if draft.strip() == PASS_TOKEN and any(f"@{self.me}" in m["text"] for m in talk[-2:]):
+            draft = self.ask_ai(f"直前のメッセージには、あなた（@{self.me}）宛ての発言が含まれています。"
+                                f"返答が必要なら、投稿する本文を書いてください。本当に不要な場合だけ、もう一度 {PASS_TOKEN} と書いてください。")
+            n += 1
+            self.panel.step(turn, kind="draft", n=n, text=draft)
         auto_left = self.args.max_rewrites if self.args.guard == "auto" else 0
         while True:
             if self.keep_floor() is False:
