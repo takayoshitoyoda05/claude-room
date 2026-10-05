@@ -6,6 +6,9 @@ import argparse
 import json
 import os
 import re
+import shutil
+import stat
+import subprocess
 import socket
 import sys
 import tempfile
@@ -23,6 +26,10 @@ sys.path.insert(0, str(Path(__file__).resolve().parent.parent))
 import claude_room as cr  # noqa: E402
 
 POSIX = os.name == "posix"
+
+
+def secrets_hex():
+    return os.urandom(4).hex()
 
 
 def call(base, path, key=None, data=None, headers=None, timeout=10):
@@ -96,6 +103,14 @@ class InviteTests(unittest.TestCase):
             self.inv.create("claude-bob")                       # AI の名前と重なる
         with self.assertRaises(ValueError):
             self.inv.create("alice", reserved={"alice"})        # ホストの名前
+
+    def test_reserved_on_object_and_stored_invites(self):
+        # 起動時の --invite でも、保存済みの招待でも、ホストの名前は使えない
+        _, key = self.inv.create("alice")            # まだ予約されていない（古い版で作った招待のつもり）
+        self.inv.reserved = {"alice"}
+        with self.assertRaises(ValueError):
+            self.inv.create("alice")
+        self.assertIsNone(self.inv.find(key))
 
     @unittest.skipUnless(POSIX, "POSIX のファイル権限")
     def test_file_is_private(self):
@@ -211,6 +226,74 @@ class ServerTests(unittest.TestCase):
             self.fail("取り消しても、受信が切れない")
         s.close()
 
+    def _race(self, path, body_for):
+        """要求がロックの手前で待っている間に招待を取り消しても、受け付けないこと。"""
+        name = "r" + secrets_hex()
+        _, key = self.invites.create(name)
+        result = {}
+        self.room.cond.acquire()
+        try:
+            t = threading.Thread(target=lambda: result.update(code=call(self.base, path, key, body_for(name))[0]))
+            t.start()
+            time.sleep(0.7)                   # 鍵の確認を通り、ロックの手前で待っている
+            self.invites.revoke(name)
+        finally:
+            self.room.cond.release()
+        t.join(10)
+        return result.get("code")
+
+    def test_revoke_race_all_actions(self):
+        self.assertEqual(self._race("/api/send", lambda n: {"name": n, "text": "late"}), 401)
+        self.assertEqual(self._race("/api/floor", lambda n: {"name": "claude-" + n, "action": "claim"}), 401)
+        self.assertEqual(self._race("/api/control", lambda n: {"by": n, "paused": True}), 401)
+        self.assertEqual(self._race("/api/status", lambda n: {"name": "claude-" + n, "status": "idle"}), 401)
+        self.assertIsNone(self.room.floor)
+        self.assertFalse(self.room.paused)
+
+    def test_messages_after_revoke(self):
+        bob_id = self.invites.find(self.bob)["id"]
+        self.invites.revoke(bob_id)
+        self.assertEqual(call(self.base, "/api/messages", self.bob)[0], 401)
+
+    def test_control_noop_is_not_logged_and_limited(self):
+        before = len(self.room.messages)
+        for _ in range(5):
+            self.assertEqual(call(self.base, "/api/control", self.bob, {"by": "bob", "max_turns": 0})[0], 200)
+        self.assertEqual(len(self.room.messages), before)        # 何も変えない操作は記録しない
+        codes = [call(self.base, "/api/control", self.bob, {"by": "bob", "max_turns": 0})[0]
+                 for _ in range(cr.POST_RATE)]
+        self.assertIn(429, codes)
+
+    def test_cid_is_per_sender(self):
+        a = call(self.base, "/api/send", self.bob, {"name": "bob", "text": "from bob", "cid": "same"})
+        b = call(self.base, "/api/send", self.carol, {"name": "carol", "text": "from carol", "cid": "same"})
+        self.assertEqual((a[0], b[0]), (200, 200))
+        self.assertNotEqual(a[1]["seq"], b[1]["seq"])             # 別の人の同じ ID で、投稿が消えない
+        c = call(self.base, "/api/send", self.bob, {"name": "bob", "text": "changed", "cid": "same"})
+        self.assertEqual(c[0], 409)                               # 同じ人の同じ ID で、中身が違う
+
+    def test_pagination_does_not_drop(self):
+        for i in range(1200):
+            self.room.post("alice", "human", f"m{i}")
+        code, r = call(self.base, "/api/messages?after=0", self.key)
+        self.assertEqual((len(r["messages"]), r["more"]), (cr.MAX_FETCH, True))
+        self.assertEqual(r["messages"][0]["text"], "m0")          # 古い順。最初の発言が欠けない
+        seen, after = [], 0
+        while True:
+            r = call(self.base, f"/api/messages?after={after}", self.key)[1]
+            seen += r["messages"]
+            if not r["more"]:
+                break
+            after = r["messages"][-1]["seq"]
+        self.assertEqual(len(seen), 1200)
+        tail = call(self.base, "/api/messages?tail=1", self.key)[1]["messages"]
+        self.assertEqual(tail[-1]["text"], "m1199")
+
+    @unittest.skipUnless(POSIX, "POSIX のファイル権限")
+    def test_log_is_private(self):
+        self.room.post("alice", "human", "secret")
+        self.assertEqual(self.room.log_path.stat().st_mode & 0o077, 0)
+
     def test_page_has_csp(self):
         with urllib.request.urlopen(self.base + "/") as r:
             csp = r.headers["Content-Security-Policy"]
@@ -274,6 +357,12 @@ class MaliciousHostTests(unittest.TestCase):
         self.assertFalse(st["paused"])
         self.assertEqual(st["agents"], [{"name": "claude-bob", "muted": False}])
 
+    def test_clean_state_bad_shapes(self):
+        self.assertEqual(cr.Agent._clean_state({"agents": 1})["agents"], [])
+        self.assertEqual(cr.Agent._clean_state({"agents": {"a": 1}})["agents"], [])
+        with self.assertRaises(ValueError):
+            cr.Agent._clean_state("x")
+
     def test_system_prompt_has_no_room_name(self):
         self.assertNotIn("{room}", cr.SYSTEM_PROMPT)
 
@@ -326,6 +415,88 @@ class FileTests(unittest.TestCase):
             self.assertEqual(path.stat().st_mode & 0o077, 0)
 
 
+class ProcessTests(unittest.TestCase):
+    def _agent(self):
+        ag = object.__new__(cr.Agent)
+        ag.args = argparse.Namespace(workdir=tempfile.mkdtemp(dir=_TMP), timeout=60)
+        ag.keep_floor = lambda: True
+        return ag
+
+    def _run(self, ag):
+        procs = []
+        real = cr.subprocess.Popen
+
+        class Spy(real):
+            def __init__(self, *a, **k):
+                super().__init__(*a, **k)
+                procs.append(self)
+        cr.subprocess.Popen = Spy
+        try:
+            ag._run_process([sys.executable, "-c", "import time; time.sleep(30)"], "")
+        finally:
+            cr.subprocess.Popen = real
+            time.sleep(0.2)
+            self.assertTrue(procs and procs[0].poll() is not None, "AI のプロセスが残っている")
+
+    def test_child_is_killed_on_unexpected_error(self):
+        ag = self._agent()
+
+        def boom():
+            raise RuntimeError("ホストの応答が壊れている")
+        ag._halted_now = boom
+        with self.assertRaises(RuntimeError):
+            self._run(ag)
+
+    def test_child_is_killed_when_stopped(self):
+        ag = self._agent()
+        ag._halted_now = lambda: True
+        with self.assertRaises(cr.Stopped):
+            self._run(ag)
+
+
+class CodexTests(unittest.TestCase):
+    def ev(self, *events):
+        return "\n".join(json.dumps(e) for e in events)
+
+    def test_parse_requires_completion(self):
+        start = {"type": "thread.started", "thread_id": "t1"}
+        msg = {"type": "item.completed", "item": {"type": "agent_message", "text": "答え"}}
+        done = {"type": "turn.completed", "usage": {"input_tokens": 1, "output_tokens": 2}}
+        self.assertEqual(cr.parse_codex_events(self.ev(start, msg, done))[:2], ("答え", "t1"))
+        with self.assertRaises(RuntimeError):
+            cr.parse_codex_events(self.ev(start, msg))                       # 最後まで終わっていない
+        with self.assertRaises(RuntimeError):
+            cr.parse_codex_events(self.ev(start, msg, {"type": "turn.failed", "error": {"message": "x"}}, done))
+        with self.assertRaises(RuntimeError):
+            cr.parse_codex_events(self.ev(start, msg, done), code=1)
+
+    @unittest.skipUnless(POSIX, "偽の codex コマンドはシェルスクリプト")
+    def test_codex_home_is_per_instance(self):
+        d = Path(tempfile.mkdtemp(dir=_TMP))
+        (d / "codex").write_text("#!/bin/sh\necho 'shell_tool stable true'\necho 'unified_exec stable true'\n")
+        (d / "codex").chmod(0o755)
+        home = d / "dot-codex"
+        home.mkdir()
+        (home / "auth.json").write_text("{}")
+        env = {"PATH": f"{d}{os.pathsep}{os.environ['PATH']}", "CODEX_HOME": str(home)}
+        old = {k: os.environ.get(k) for k in env}
+        os.environ.update(env)
+        try:
+            args = lambda: argparse.Namespace(agent="codex", tools=None, policy=None, guard="auto", workdir=None,
+                                              panel_port=0, confirm=False)
+            a, b = cr.Agent("http://x", "k", "bob", args()), cr.Agent("http://x", "k", "bob", args())
+            self.assertNotEqual(a.codex_home, b.codex_home)      # 同じ名前でも、設定のフォルダは別
+            self.assertTrue((a.codex_home / "auth.json").exists())
+            a.panel.close()
+            b.panel.close()
+        finally:
+            for k, v in old.items():
+                if v is None:
+                    os.environ.pop(k, None)
+                else:
+                    os.environ[k] = v
+
+
 class PanelTests(unittest.TestCase):
     def setUp(self):
         ag = object.__new__(cr.Agent)
@@ -333,6 +504,9 @@ class PanelTests(unittest.TestCase):
         ag.args = argparse.Namespace(guard="auto", confirm=False)
         self.panel = cr.Panel(ag, 0)
         self.base = f"http://127.0.0.1:{self.panel.port}"
+
+    def tearDown(self):
+        self.panel.close()
 
     def test_host_header_and_token(self):
         self.assertEqual(call(self.base, "/api/state?v=-1")[0], 401)
@@ -345,6 +519,28 @@ class PanelTests(unittest.TestCase):
         with urllib.request.urlopen(self.base + "/") as r:
             self.assertIn("script-src 'nonce-", r.headers["Content-Security-Policy"])
             self.assertIsNone(re.search(r'\son[a-z]+="', r.read().decode()))
+
+
+@unittest.skipUnless(shutil.which("node"), "node がない")
+class PanelRenderTests(unittest.TestCase):
+    """代理人パネルの描画関数に、悪意のある値を渡しても、タグとして出ないこと（node で実際に動かす）。"""
+
+    def test_turn_html_escapes_everything(self):
+        js = re.search(r'<script nonce="__NONCE__">(.*)</script>', cr.PANEL_PAGE, re.S).group(1)
+        stub = ("var document={addEventListener(){},activeElement:null,querySelector(){return null},"
+                "querySelectorAll(){return[]}};var location={hash:''};"
+                "var fetch=()=>new Promise(()=>{});var window={};")
+        evil = "<svg/onload=alert(1)>"
+        turn = {"id": 1, "status": evil, "incoming": [{"seq": evil, "name": evil, "text": evil}],
+                "steps": [{"kind": "draft", "n": 1, "text": evil},
+                          {"kind": "check", "ok": False, "by": evil, "reasons": [evil], "quotes": [evil], "hint": evil},
+                          {"kind": "human", "action": evil, "text": evil}],
+                "pending": {"draft": evil, "verdict": None}, "error": evil}
+        code = stub + js + f"\nprocess.stdout.write(turnHtml({json.dumps(turn)}));"
+        out = subprocess.run(["node", "-e", code], capture_output=True, text=True, timeout=30)
+        self.assertEqual(out.returncode, 0, out.stderr)
+        self.assertNotIn("<svg", out.stdout)
+        self.assertIn("&lt;svg", out.stdout)
 
 
 if __name__ == "__main__":

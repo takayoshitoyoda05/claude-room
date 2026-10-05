@@ -10,6 +10,8 @@
 `claude -p`（Claude Code）か `codex exec`（Codex CLI）で動く。
 """
 import argparse
+import atexit
+import collections
 import getpass
 import hashlib
 import json
@@ -55,7 +57,8 @@ NAME_RE = re.compile(r"(?![.\-])[\w\-.]{1,40}")          # 名前全般（先頭
 HUMAN_MAX = 32                                             # 人間の名前。AI の名前（claude-<名前>）が 40 文字に収まるように
 MAX_HISTORY = 5000                                         # メモリに置く発言の数
 MAX_FETCH = 500                                            # 1 回で返す発言の数
-POST_RATE = 30                                             # 1 人（招待）あたり、1 分に投稿できる回数
+POST_RATE = 30                                             # 1 人（招待）あたり、1 分に投稿・操作できる回数
+MAX_LOG_BYTES = 50 * 1024 * 1024                           # ログがこの大きさを超えたら、古いログに切り替える
 STATUSES = {"idle", "thinking", "checking", "awaiting"}
 
 
@@ -75,6 +78,13 @@ def ai_product(name):
         if name.startswith(p + "-") and valid_human(name[len(p) + 1:]):
             return p
     return None
+
+
+def append_private(path, line):
+    """本人だけが読めるファイル（0600）に 1 行足す。"""
+    fd = os.open(str(path), os.O_WRONLY | os.O_CREAT | os.O_APPEND, 0o600)
+    with os.fdopen(fd, "a", encoding="utf-8") as f:
+        f.write(line)
 
 
 class Denied(Exception):
@@ -109,15 +119,18 @@ class Room:
         self.version = 0
         self.invite_bases = []
         self.host_name = ""
-        self._cids = {}             # 発言の ID -> 発言（二重投稿を防ぐ）
+        self._cids = {}             # (送った人, 発言の ID) -> (発言, 本文)。二重投稿を防ぐ
         if log_path.exists():
+            try:
+                log_path.chmod(0o600)
+            except OSError:
+                pass
             with open(log_path, encoding="utf-8") as f:
-                for line in f:
+                for line in collections.deque(f, maxlen=MAX_HISTORY):     # 末尾だけ読む
                     try:
                         self.messages.append(json.loads(line))
                     except ValueError:
                         pass
-            del self.messages[:-MAX_HISTORY]
 
     def _bump(self):
         self.version += 1
@@ -127,7 +140,13 @@ class Room:
         return self.messages[-1]["seq"] if self.messages else 0
 
     def since(self, after, limit=MAX_FETCH):
-        return [m for m in self.messages if m["seq"] > after][-limit:]
+        """after より新しい発言を、古い順に最大 limit 件。続きがあるかも返す（取りこぼさないように）。"""
+        rest = [m for m in self.messages if m["seq"] > after]
+        return rest[:limit], len(rest) > limit
+
+    def tail(self, limit=MAX_FETCH):
+        """最新の limit 件（参加した直後の読み込み用）。"""
+        return self.messages[-limit:]
 
     def state(self):
         now = time.time()
@@ -142,7 +161,7 @@ class Room:
             "invite_bases": self.invite_bases,
         }
 
-    def post(self, name, kind, text, cid=None, check=None):
+    def post(self, name, kind, text, cid=None, check=None, who="host"):
         """発言を部屋に加える。AI の発言は、発言権を持ち、止められていないときだけ受け付ける。
 
         check: 招待が取り消されていないかの確認。取り消しと同じロックの中で確かめる（すれ違いをなくす）。
@@ -151,8 +170,11 @@ class Room:
         with self.cond:
             if check is not None and not check():
                 raise Denied(401, "この招待は取り消されました")
-            if cid and cid in self._cids:
-                return self._cids[cid]
+            if cid and (who, cid) in self._cids:
+                prev, prev_text = self._cids[(who, cid)]
+                if prev_text != text:
+                    raise Denied(409, "同じ ID で、違う内容が送られました")
+                return prev
             if kind in AI_KINDS:
                 now = time.time()
                 a = self.agents.get(name)
@@ -163,15 +185,16 @@ class Room:
             msg = {"seq": self._last_seq() + 1, "ts": time.time(), "name": name,
                    "kind": kind, "text": text}
             try:     # 先にログへ書く。書けなければ、メモリにも加えない（ログと食い違わないように）
-                with open(self.log_path, "a", encoding="utf-8") as f:
-                    f.write(json.dumps(msg, ensure_ascii=False) + "\n")
+                if self.log_path.exists() and self.log_path.stat().st_size > MAX_LOG_BYTES:
+                    self.log_path.replace(self.log_path.with_name(self.log_path.stem + ".old.jsonl"))
+                append_private(self.log_path, json.dumps(msg, ensure_ascii=False) + "\n")
             except OSError as e:
                 raise Denied(507, f"ログを書けません: {e}")
             self.messages.append(msg)
             if len(self.messages) > MAX_HISTORY:
                 del self.messages[:len(self.messages) - MAX_HISTORY]
             if cid:
-                self._cids[cid] = msg
+                self._cids[(who, cid)] = (msg, text)
                 while len(self._cids) > 2000:
                     self._cids.pop(next(iter(self._cids)))
             if kind == "human":
@@ -210,17 +233,50 @@ class Room:
                     self.floor = None
             self._bump()
 
-    def set_status(self, name, status):
+    def set_status(self, name, status, check=None):
         with self.cond:
+            if check is not None and not check():
+                raise Denied(401, "この招待は取り消されました")
             if name in self.agents and self.agents[name]["status"] != status:
                 self.agents[name]["status"] = status
                 self._bump()
 
+    def control(self, d, by, check=None):
+        """止める・再開する・上限を変える。値が変わったときだけ記録する。取り消しの確認も同じロックの中で。"""
+        with self.cond:
+            if check is not None and not check():
+                raise Denied(401, "この招待は取り消されました")
+            notes = []
+            if "paused" in d and bool(d["paused"]) != self.paused:
+                self.paused = bool(d["paused"])
+                notes.append("全員の AI を止めました" if self.paused else "AI を再開しました")
+            target = str(d.get("agent") or "")
+            if "muted" in d and target in self.agents and bool(d["muted"]) != self.agents[target]["muted"]:
+                self.agents[target]["muted"] = bool(d["muted"])
+                notes.append(f"{target} を" + ("止めました" if d["muted"] else "再開しました"))
+            if "add_turns" in d and self.max_turns:
+                new = self.auto_turns + max(1, int(d["add_turns"]))
+                if new != self.max_turns:
+                    self.max_turns = new
+                    notes.append(f"AI の連続発言の上限を {self.max_turns} 回にしました")
+            if "max_turns" in d:
+                new = max(0, min(1000, int(d["max_turns"])))
+                if new != self.max_turns:
+                    self.max_turns = new
+                    notes.append("AI の連続発言の上限をなくしました" if not new
+                                 else f"AI の連続発言の上限を {new} 回にしました")
+            for n in notes:
+                self.post("system", "system", f"{by}が{n}")
+            self._bump()
+            return self.state()
+
     def limit_hit(self):
         return bool(self.max_turns) and self.auto_turns >= self.max_turns
 
-    def claim(self, name):
+    def claim(self, name, check=None):
         with self.cond:
+            if check is not None and not check():
+                raise Denied(401, "この招待は取り消されました")
             now = time.time()
             ok = not self.paused and not self.limit_hit() and not (
                 name in self.agents and self.agents[name]["muted"]) and not (
@@ -233,8 +289,10 @@ class Room:
                 self._bump()
             return ok, self.state()
 
-    def release(self, name):
+    def release(self, name, check=None):
         with self.cond:
+            if check is not None and not check():
+                raise Denied(401, "この招待は取り消されました")
             if self.floor and self.floor[0] == name:
                 self.floor = None
                 self._bump()
@@ -287,8 +345,12 @@ class HardenedServer(ThreadingHTTPServer):
             return
         super().handle_error(request, client_address)
 
+    def server_close(self):
+        self._closed = True
+        super().server_close()
+
     def _reaper(self):
-        while True:
+        while not getattr(self, "_closed", False):
             time.sleep(2)
             now = time.time()
             with self._lock:
@@ -323,6 +385,8 @@ class HardenedServer(ThreadingHTTPServer):
             if ok:
                 recent.append(now)
             self._posts[who] = recent
+            if len(self._posts) > 1000:
+                self._posts = {k: v for k, v in self._posts.items() if v and now - v[-1] < 60}
             return ok
 
     def too_many_fails(self, ip):
@@ -366,6 +430,7 @@ class Invites:
         self.path = path
         self.lock = threading.Lock()
         self.items = []
+        self.reserved = set()       # 招待に使えない名前（ホストの名前）
         if path.exists():
             try:
                 self.items = json.loads(path.read_text(encoding="utf-8"))
@@ -382,6 +447,7 @@ class Invites:
         tmp.replace(self.path)
 
     def create(self, name, reserved=()):
+        reserved = set(reserved) | self.reserved
         if not valid_human(name):
             raise ValueError(f"名前に使えるのは、文字・数字・- _ . の {HUMAN_MAX} 文字までです"
                              "（先頭に . と - は使えず、claude- と codex- で始まる名前も使えません）")
@@ -401,7 +467,9 @@ class Invites:
         h = _sha256(key)
         with self.lock:
             for i in self.items:
-                if not i["revoked"] and secrets.compare_digest(i["hash"], h):
+                # 保存された招待も確かめる（古い版で作った招待や、ホストと同じ名前の招待は使わせない）
+                if not i["revoked"] and secrets.compare_digest(i["hash"], h) \
+                        and valid_human(i["name"]) and i["name"] not in self.reserved:
                     return dict(i)
         return None
 
@@ -521,7 +589,13 @@ def make_handler(room, key, invites):
                 return self._json(200, {"invites": invites.listing(), "bases": room.invite_bases})
             if u.path == "/api/messages":
                 with room.cond:
-                    return self._json(200, {"messages": room.since(after), "state": room.state()})
+                    if not self._still_valid():
+                        return self._json(401, {"error": "この招待は取り消されました"})
+                    if qs.get("tail", [""])[0] == "1":
+                        msgs, more = room.tail(), False
+                    else:
+                        msgs, more = room.since(after)
+                    return self._json(200, {"messages": msgs, "more": more, "state": room.state()})
             if u.path == "/api/wait":
                 name, owner = qs.get("name", [""])[0], qs.get("owner", [""])[0]
                 if name:
@@ -540,7 +614,8 @@ def make_handler(room, key, invites):
                         room.cond.wait_for(lambda: room.version != v, timeout=timeout)
                         if not self._still_valid():
                             return self._json(401, {"error": "この招待は取り消されました"})
-                        return self._json(200, {"messages": room.since(after), "state": room.state()})
+                        msgs, more = room.since(after)
+                        return self._json(200, {"messages": msgs, "more": more, "state": room.state()})
                 finally:
                     self.server.end_stream()
             if u.path == "/api/stream":
@@ -571,7 +646,11 @@ def make_handler(room, key, invites):
                         room.cond.wait_for(lambda: room.version != v, timeout=15)
                         if not self._still_valid():
                             break
-                        msgs, st, v = room.since(after), room.state(), room.version
+                        msgs, more = room.since(after)
+                        while more:                     # 溜まっている分は、全部送る
+                            page, more = room.since(msgs[-1]["seq"])
+                            msgs += page
+                        st, v = room.state(), room.version
                     out = []
                     for m in msgs:
                         out.append("event: msg\ndata: " + json.dumps(m, ensure_ascii=False) + "\n\n")
@@ -628,43 +707,26 @@ def make_handler(room, key, invites):
                 if not self.server.rate_ok(self.who.get("id", "host")):
                     return self._json(429, {"error": "投稿が多すぎます。少し待ってください"})
                 cid = str(d.get("cid") or "")[:64] or None
-                return self._json(200, room.post(name, kind, text[:MAX_TEXT], cid=cid, check=self._check()))
+                return self._json(200, room.post(name, kind, text[:MAX_TEXT], cid=cid, check=self._check(),
+                                                 who=self.who.get("id", "host")))
             if path == "/api/control":
-                notes = []
-                with room.cond:
-                    if "paused" in d and bool(d["paused"]) != room.paused:
-                        room.paused = bool(d["paused"])
-                        notes.append("全員の AI を止めました" if room.paused else "AI を再開しました")
-                    target = str(d.get("agent") or "")
-                    if "muted" in d and target in room.agents \
-                            and bool(d["muted"]) != room.agents[target]["muted"]:
-                        room.agents[target]["muted"] = bool(d["muted"])
-                        notes.append(f"{target} を" + ("止めました" if d["muted"] else "再開しました"))
-                    if "add_turns" in d and room.max_turns:
-                        room.max_turns = room.auto_turns + max(1, int(d["add_turns"]))
-                        notes.append(f"AI の連続発言の上限を {room.max_turns} 回にしました")
-                    if "max_turns" in d:
-                        room.max_turns = max(0, min(1000, int(d["max_turns"])))
-                        notes.append("AI の連続発言の上限をなくしました" if not room.max_turns
-                                     else f"AI の連続発言の上限を {room.max_turns} 回にしました")
-                    room._bump()
-                for n in notes:
-                    room.post("system", "system", f"{name or self.who.get('name') or '誰か'}が{n}")
-                with room.cond:
-                    return self._json(200, room.state())
+                if not self.server.rate_ok(self.who.get("id", "host")):
+                    return self._json(429, {"error": "操作が多すぎます。少し待ってください"})
+                by = name or self.who.get("name") or "誰か"
+                return self._json(200, room.control(d, by, check=self._check()))
             if path in ("/api/floor", "/api/status") and not ai_product(name):
                 return self._json(400, {"error": "AI の名前が必要です"})
             if path == "/api/floor":
                 if d.get("action") == "claim":
-                    ok, st = room.claim(name)
+                    ok, st = room.claim(name, check=self._check())
                     return self._json(200, {"ok": ok, "state": st})
-                room.release(name)
+                room.release(name, check=self._check())
                 return self._json(200, {"ok": True})
             if path == "/api/status":
                 status = str(d.get("status") or "idle")
                 if status not in STATUSES:
                     return self._json(400, {"error": "bad status"})
-                room.set_status(name, status)
+                room.set_status(name, status, check=self._check())
                 return self._json(200, {"ok": True})
             self._json(404, {"error": "not found"})
 
@@ -673,17 +735,18 @@ def make_handler(room, key, invites):
                 return self._json(403, {"error": "招待を作ったり取り消したりできるのは、ホストだけです"})
             if path == "/api/invites":
                 try:
-                    item, inv_key = invites.create(str(d.get("name") or "").strip(), reserved={room.host_name})
+                    item, inv_key = invites.create(str(d.get("name") or "").strip())
                 except ValueError as e:
                     return self._json(400, {"error": str(e)})
                 return self._json(200, {"invite": item, "key": inv_key, "bases": room.invite_bases})
             if path == "/api/invites/revoke":
-                with room.cond:     # 投稿の受け付けと同じロックの中で取り消す（すれ違いをなくす）
+                with room.cond:     # 取り消し・部屋から外す・お知らせを、投稿の受け付けと同じロックの中で一度に
                     item = invites.revoke(str(d.get("id") or d.get("name") or ""))
+                    if item:
+                        room.kick(guest_names(item["name"]))
+                        room.post("system", "system", f"{item['name']} の招待を取り消しました")
                 if not item:
                     return self._json(404, {"error": "その招待は見つからないか、すでに取り消されています"})
-                room.kick(guest_names(item["name"]))
-                room.post("system", "system", f"{item['name']} の招待を取り消しました")
                 return self._json(200, {"invite": item})
             return self._json(404, {"error": "not found"})
 
@@ -914,12 +977,18 @@ class Panel:
             log("[警告] 代理人パネルを開けませんでした")
             return
         threading.Thread(target=srv.serve_forever, daemon=True).start()
+        self.srv = srv
         self.port = srv.server_address[1]
         self.url = f"http://localhost:{self.port}/#t={self.token}"
 
     def _bump(self):
         self.version += 1
         self.lock.notify_all()
+
+    def close(self):
+        if self.url:
+            self.srv.shutdown()
+            self.srv.server_close()
 
     def new_turn(self, talk):
         with self.lock:
@@ -1114,6 +1183,7 @@ class Agent:
                      "（--panel-port で別のポートを指定してください）")
         self.record_path = DATA_DIR / f"agent-{self.me}.jsonl"
         self._record_warned = False
+        self._fails = {}
         self._q = f"&name={quote(self.me)}&owner={quote(self.owner)}&agent={self.product}"
 
     def _setup_claude(self):
@@ -1135,8 +1205,9 @@ class Agent:
         そこで CODEX_HOME を部屋専用のフォルダにし、ログイン情報（auth.json）だけをシンボリックリンクで共有する
         （Codex は auth.json をその場で上書きするので、トークンが更新されても普段の Codex のログインは切れない）。
         """
-        home = DATA_DIR / "codex-home" / self.me
-        home.mkdir(parents=True, exist_ok=True)
+        # 起動ごとに別のフォルダにする（同じ名前で 2 つの部屋に同時に参加しても、設定が混ざらないように）
+        home = Path(tempfile.mkdtemp(prefix=f"{self.me}-", dir=str(_ensure_dir(DATA_DIR / "codex-home"))))
+        atexit.register(shutil.rmtree, str(home), True)
         auth = home / "auth.json"
         src = Path(os.environ.get("CODEX_HOME") or Path.home() / ".codex") / "auth.json"
         if not auth.exists() and not auth.is_symlink() and src.exists():
@@ -1202,8 +1273,9 @@ class Agent:
         def num(k):
             v = st.get(k)
             return v if type(v) is int and v >= 0 else 0
+        raw = st.get("agents")
         agents = [{"name": a["name"], "muted": a.get("muted") is True}
-                  for a in st.get("agents") or [] if isinstance(a, dict)
+                  for a in (raw if isinstance(raw, list) else []) if isinstance(a, dict)
                   and isinstance(a.get("name"), str) and NAME_RE.fullmatch(a["name"])]
         room = st.get("room")
         version = st.get("version")
@@ -1230,7 +1302,7 @@ class Agent:
 
     def run(self):
         try:
-            self._absorb(self.api("GET", "/api/messages?after=0"))
+            self._absorb(self.api("GET", "/api/messages?tail=1"))
         except Kicked:
             sys.exit("この鍵では入れません（招待が取り消されたか、URL が違います）")
         except urllib.error.HTTPError as e:
@@ -1252,8 +1324,11 @@ class Agent:
         while True:
             try:
                 last = self.history[-1]["seq"] if self.history else 0
-                st = self._absorb(self.api("GET", f"/api/wait?after={last}&v={self.v}&timeout=25{self._q}",
-                                           timeout=60))
+                r = self.api("GET", f"/api/wait?after={last}&v={self.v}&timeout=25{self._q}", timeout=60)
+                st = self._absorb(r)
+                while isinstance(r, dict) and r.get("more") is True:     # 溜まっている分を全部読む
+                    r = self.api("GET", f"/api/messages?after={self.history[-1]['seq']}")
+                    st = self._absorb(r)
                 self.maybe_reply(st)
             except Kicked as e:
                 sys.exit(f"部屋から外されました（招待が取り消されたか、鍵が無効になりました）: {e}")
@@ -1273,11 +1348,15 @@ class Agent:
         return self._halted(self._clean_state(r.get("state") if isinstance(r, dict) else None))
 
     def keep_floor(self):
-        """発言権の期限を延ばす（考えている・確認を待っている間に、ほかの AI が話し始めないように）。"""
+        """発言権の期限を延ばす（考えている・確認を待っている間に、ほかの AI が話し始めないように）。
+
+        延ばせたら True、発言権を失っていたら False、通信できなかったら None。
+        """
         try:
-            self.api("POST", "/api/floor", {"name": self.me, "action": "claim"}, timeout=8)
+            r = self.api("POST", "/api/floor", {"name": self.me, "action": "claim"}, timeout=8)
         except (OSError, ValueError):
-            pass
+            return None
+        return isinstance(r, dict) and r.get("ok") is True
 
     def _status(self, status):
         try:
@@ -1330,9 +1409,13 @@ class Agent:
                 log("→ 人間に止められたので、作りかけの返答を捨てました")
                 return
             except Exception as e:  # noqa: BLE001 — AI の失敗で部屋を止めない
-                self.replied_upto = upto
                 self.panel.set(turn, status="error", error=str(e)[:300])
-                log(f"[{self.label} のエラー] {e}")
+                self._fails[upto] = self._fails.get(upto, 0) + 1
+                if self._fails[upto] >= 3:     # 3 回続けて失敗したら、この発言はあきらめる
+                    self.replied_upto = upto
+                    log(f"[{self.label} のエラー] {e}（3 回失敗したので、この発言には答えません）")
+                else:
+                    log(f"[{self.label} のエラー] {e}（あとで答え直します）")
                 return
             if self._halted_now():
                 self.panel.set(turn, status="cancelled")
@@ -1379,7 +1462,8 @@ class Agent:
         self.panel.step(turn, kind="draft", n=n, text=draft)
         auto_left = self.args.max_rewrites if self.args.guard == "auto" else 0
         while True:
-            self.keep_floor()
+            if self.keep_floor() is False:
+                raise Stopped()        # 発言権を失った（止められた、など）
             if draft.strip() == PASS_TOKEN:
                 return draft
             verdict = None
@@ -1458,8 +1542,8 @@ class Agent:
 
     def _record(self, turn):
         try:
-            with open(self.record_path, "a", encoding="utf-8") as f:
-                f.write(json.dumps({k: v for k, v in turn.items() if k != "pending"}, ensure_ascii=False) + "\n")
+            append_private(self.record_path, json.dumps({k: v for k, v in turn.items() if k != "pending"},
+                                                        ensure_ascii=False) + "\n")
         except OSError as e:
             if not self._record_warned:
                 self._record_warned = True
@@ -1550,30 +1634,10 @@ class Agent:
             stdout, stderr, code = self._run_process(cmd, prompt, env=self.codex_env)
         finally:
             _remove(path)
-        thread, msgs, err, usage = None, [], None, None
-        for line in stdout.splitlines():
-            try:
-                e = json.loads(line)
-            except ValueError:
-                continue
-            if not isinstance(e, dict):
-                continue
-            t = e.get("type")
-            if t == "thread.started":
-                thread = e.get("thread_id")
-            elif t == "item.completed" and isinstance(e.get("item"), dict) \
-                    and e["item"].get("type") == "agent_message":
-                msgs.append(str(e["item"].get("text") or ""))
-            elif t in ("error", "turn.failed"):
-                err = e.get("message") or (e.get("error") or {}).get("message") or str(e)
-            elif t == "turn.completed":
-                usage = e.get("usage")
-        # 途中で失敗したときは、途中の発言を最終の答えとして使わない
-        if err or code != 0 or not msgs:
-            raise RuntimeError((err or stderr or f"Codex が応答しませんでした（終了コード {code}）").strip()[-500:])
+        text, thread, usage = parse_codex_events(stdout, stderr, code)
         if isinstance(usage, dict):
             log(f"   （トークン: 入力 {usage.get('input_tokens')}・出力 {usage.get('output_tokens')}）")
-        return msgs[-1].strip(), thread or resume
+        return text, thread or resume
 
     def _run_process(self, cmd, prompt, env=None):
         posix = os.name == "posix"
@@ -1593,28 +1657,56 @@ class Agent:
         deadline = time.time() + self.args.timeout
         last_renew = time.time()
         pending_input = prompt
-        while True:
-            try:
-                stdout, stderr = p.communicate(pending_input, timeout=2)
-                return stdout, stderr, p.returncode
-            except subprocess.TimeoutExpired:
-                pending_input = None
-            stop = time.time() > deadline
-            try:
-                stop = stop or self._halted_now()
-                if time.time() - last_renew > 60:
-                    self.keep_floor()
-                    last_renew = time.time()
-            except Kicked:
+        try:
+            while True:
+                try:
+                    stdout, stderr = p.communicate(pending_input, timeout=2)
+                    return stdout, stderr, p.returncode
+                except subprocess.TimeoutExpired:
+                    pending_input = None
+                stop = time.time() > deadline
+                try:
+                    stop = stop or self._halted_now()
+                    if time.time() - last_renew > 60:
+                        stop = stop or self.keep_floor() is False      # 発言権を失ったら、考えるのをやめる
+                        last_renew = time.time()
+                except (OSError, ValueError):
+                    pass
+                if stop:
+                    if time.time() > deadline:
+                        raise RuntimeError(f"{self.args.timeout} 秒たっても返答がありません")
+                    raise Stopped()
+        finally:
+            if p.poll() is None:      # どんな理由で抜けるときも、AI のプロセスを残さない
                 kill()
-                raise
-            except (OSError, ValueError):
-                pass
-            if stop:
-                kill()
-                if time.time() > deadline:
-                    raise RuntimeError(f"{self.args.timeout} 秒たっても返答がありません")
-                raise Stopped()
+
+
+def parse_codex_events(stdout, stderr="", code=0):
+    """codex exec --json の出力から (最後の発言, 会話 ID, 使ったトークン) を取り出す。
+
+    最後まで終わった知らせ（turn.completed）があり、失敗の知らせがなく、終了コードが 0 のときだけ成功とする
+    （途中で失敗したときの、途中の発言を答えとして使わないため）。
+    """
+    thread, msgs, err, usage, completed = None, [], None, None, False
+    for line in stdout.splitlines():
+        try:
+            e = json.loads(line)
+        except ValueError:
+            continue
+        if not isinstance(e, dict):
+            continue
+        t = e.get("type")
+        if t == "thread.started":
+            thread = e.get("thread_id") if isinstance(e.get("thread_id"), str) else None
+        elif t == "item.completed" and isinstance(e.get("item"), dict) and e["item"].get("type") == "agent_message":
+            msgs.append(str(e["item"].get("text") or ""))
+        elif t in ("error", "turn.failed"):
+            err = e.get("message") or (e.get("error") or {}).get("message") or str(e)
+        elif t == "turn.completed":
+            completed, usage = True, e.get("usage")
+    if err or code != 0 or not completed or not msgs:
+        raise RuntimeError(str(err or stderr or f"Codex が最後まで答えませんでした（終了コード {code}）").strip()[-500:])
+    return msgs[-1].strip(), thread, usage
 
 
 def _private_file(text):
@@ -1629,6 +1721,11 @@ def _private_file(text):
     with os.fdopen(fd, "w", encoding="utf-8") as f:
         f.write(text)
     return path
+
+
+def _ensure_dir(d):
+    d.mkdir(parents=True, exist_ok=True)
+    return d
 
 
 def _remove(path):
@@ -1685,6 +1782,7 @@ def cmd_host(a):
     room = Room(a.room, log_path, a.max_turns)
     room.host_name = a.name
     invites = Invites(DATA_DIR / f"invites-{a.room}.json")    # 招待は部屋ごと
+    invites.reserved = {a.name}                                # ホストの名前は、どの経路でも招待に使えない
     if a.public:
         # 公開するときは 127.0.0.1 だけで待ち受け、Funnel 経由でだけ外から届くようにする
         up = serve(room, key, invites, ["127.0.0.1"], a.port)
@@ -2051,7 +2149,7 @@ async function connect(){
   if(streamCtl!==ctl)return;connState(false);setTimeout(connect,3000)}
 async function start(){
   if(!KEY)return $('#dlgKey').showModal();
-  try{const r=await api('/api/messages?after=0');store.set('key',KEY);r.messages.forEach(addMsg);setState(r.state);toBottom();connect();
+  try{const r=await api('/api/messages?tail=1');store.set('key',KEY);r.messages.forEach(addMsg);setState(r.state);toBottom();connect();
     const me=await api('/api/me');ROLE=me.role;
     if(me.name){ME=me.name;store.set('name',ME);$('#rename').style.display='none'}   // 名前は鍵で決まる
     if(ROLE!=='host')$('#invite').style.display='none'}
@@ -2130,7 +2228,7 @@ function marked(text,quotes){let h=esc(text);for(const q of quotes||[]){if(!q)co
 const STATUS={drafting:'下書き中',checking:'チェック中',pending:'あなたの判断待ち',posted:'投稿した',discarded:'捨てた',cancelled:'止められた',error:'エラー',pass:'発言なし'};
 const ACTION={send:'この文で送る',rewrite:'書き直させる',discard:'捨てる'};
 function turnHtml(t){
-  let h=`<div class="card turn ${t.status}" id="turn-${t.id}"><div class="thead"><b>ターン ${Number(t.id)}</b><span class="badge b-${esc(t.status)}">${esc(STATUS[t.status]||t.status)}</span></div>`;
+  let h=`<div class="card turn ${esc(t.status)}" id="turn-${Number(t.id)}"><div class="thead"><b>ターン ${Number(t.id)}</b><span class="badge b-${esc(t.status)}">${esc(STATUS[t.status]||t.status)}</span></div>`;
   for(const m of t.incoming)h+=`<div class="inc"><b>${esc(m.name)}</b> #${esc(String(m.seq))}: ${esc(m.text)}</div>`;
   const st=t.steps;
   st.forEach((s,i)=>{
@@ -2139,7 +2237,7 @@ function turnHtml(t){
     else if(s.kind==='check'){
       if(s.ok)h+=`<div class="verdict v-ok">✓ 秘密チェック: 問題なし</div>`;
       else h+=`<div class="verdict v-ng">✕ 秘密チェックで引っかかりました${s.by==='words'?'（止める言葉）':s.by==='error'?'（チェック失敗）':''}<ul>${s.reasons.map(r=>`<li>${esc(r)}</li>`).join('')}</ul>${s.hint?`<div class="hint">方針: ${esc(s.hint)}</div>`:''}</div>`}
-    else if(s.kind==='human')h+=`<div class="human">👤 あなたの判断: ${ACTION[s.action]||s.action}${s.text&&s.action==='rewrite'?'（指示: '+esc(s.text)+'）':''}</div>`;
+    else if(s.kind==='human')h+=`<div class="human">👤 あなたの判断: ${esc(ACTION[s.action]||s.action)}${s.text&&s.action==='rewrite'?'（指示: '+esc(s.text)+'）':''}</div>`;
   });
   if(t.status==='error'&&t.error)h+=`<div class="verdict v-ng">${esc(t.error)}</div>`;
   if(t.pending){const d=drafts[t.id]!==undefined?drafts[t.id]:t.pending.draft;
@@ -2163,7 +2261,9 @@ function render(s){
 document.addEventListener('click',e=>{const b=e.target.closest('[data-do]');if(b)decide(Number(b.dataset.turn),b.dataset.do)});
 async function decide(id,action){
   const text=action==='send'?document.querySelector(`textarea[data-t="${id}"]`).value:action==='rewrite'?document.querySelector(`textarea[data-n="${id}"]`).value:'';
-  await fetch('/api/decide',{method:'POST',headers:{'X-Token':TOKEN,'Content-Type':'application/json'},body:JSON.stringify({turn:id,action,text})});delete drafts[id]}
+  try{const r=await fetch('/api/decide',{method:'POST',headers:{'X-Token':TOKEN,'Content-Type':'application/json'},body:JSON.stringify({turn:id,action,text})});
+    if(!r.ok)throw new Error(String(r.status));delete drafts[id]}
+  catch(e){alert('送れませんでした（'+e.message+'）。編集した文はそのまま残しています')}}
 async function loop(){
   for(;;){try{const r=await fetch('/api/state?v='+v,{headers:{'X-Token':TOKEN}});
     if(r.status===401){document.body.innerHTML='<p style="padding:20px">URL が違います。ターミナルに表示された「代理人パネル」の URL を、そのまま開いてください。</p>';return}
