@@ -607,7 +607,7 @@ def make_handler(room, key, invites):
             n = int(self.headers.get("Content-Length") or 0)
             if n < 0 or n > 4 * MAX_TEXT:
                 raise ValueError("bad length")
-            return json.loads(self.rfile.read(n) or b"{}")
+            return parse_json(self.rfile.read(n) or b"{}")
 
         def do_GET(self):
             try:
@@ -1052,7 +1052,8 @@ class Panel:
 
     def new_turn(self, talk):
         with self.lock:
-            t = {"id": len(self.turns) + 1, "ts": time.time(), "status": "drafting",
+            self._next_id = getattr(self, "_next_id", 0) + 1     # 古いターンを消しても、番号は使い回さない
+            t = {"id": self._next_id, "ts": time.time(), "status": "drafting",
                  "incoming": [{"seq": m["seq"], "name": m["name"], "text": m["text"][:400]} for m in talk],
                  "steps": [], "pending": None}
             self.turns.append(t)
@@ -1185,7 +1186,7 @@ class Panel:
                     n = int(self.headers.get("Content-Length") or 0)
                     if n < 0 or n > 4 * MAX_TEXT:
                         raise ValueError
-                    d = json.loads(self.rfile.read(n) or b"{}")
+                    d = parse_json(self.rfile.read(n) or b"{}")
                     if not isinstance(d, dict):
                         raise ValueError
                     turn = int(d.get("turn", 0))
@@ -1320,7 +1321,7 @@ class Agent:
             data=json.dumps(data).encode() if data is not None else None,
             headers={"Authorization": "Bearer " + self.key, "Content-Type": "application/json"})
         try:
-            with urllib.request.urlopen(req, timeout=timeout) as r:
+            with _OPENER.open(req, timeout=timeout) as r:
                 return read_json(r, MAX_RESPONSE)
         except urllib.error.HTTPError as e:
             if e.code in (401, 403):
@@ -1946,22 +1947,38 @@ def cmd_host(a):
     Agent(f"http://{up[0]}:{a.port}", key, a.name, a).run()
 
 
+class _NoRedirect(urllib.request.HTTPRedirectHandler):
+    """転送（リダイレクト）に従わない。悪意のあるホストが、参加者の PC の中のサーバーなど別の場所へ、
+    鍵を付けたまま要求を送らせるのを防ぐ。"""
+
+    def redirect_request(self, req, fp, code, msg, headers, newurl):
+        return None          # None を返すと、転送の応答がそのまま HTTPError になる
+
+
+_OPENER = urllib.request.build_opener(_NoRedirect)
+
+
 def read_json(resp, limit):
     """応答を最大 limit バイトだけ読み、JSON として返す。大きすぎたり壊れていたりしたら ValueError。"""
     data = resp.read(limit + 1)
     if len(data) > limit:
         raise ValueError("応答が大きすぎます")
+    return parse_json(data)
+
+
+def parse_json(data):
+    """JSON を読む。壊れているとき・入れ子が深すぎるとき（RecursionError）は、どちらも ValueError にする。"""
     try:
         return json.loads(data)
-    except ValueError:
-        raise ValueError("応答が JSON ではありません")
+    except (ValueError, RecursionError):
+        raise ValueError("JSON として読めないか、入れ子が深すぎます")
 
 
 def _get_json(url, key, data=None):
     req = urllib.request.Request(url, method="POST" if data is not None else "GET",
                                  data=json.dumps(data).encode() if data is not None else None,
                                  headers={"Authorization": "Bearer " + key, "Content-Type": "application/json"})
-    with urllib.request.urlopen(req, timeout=15) as r:
+    with _OPENER.open(req, timeout=15) as r:
         return read_json(r, MAX_RESPONSE)
 
 

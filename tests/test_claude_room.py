@@ -187,6 +187,15 @@ class ServerTests(unittest.TestCase):
         self.assertEqual(codes[-1], 429)
         self.assertEqual(codes.count(200), cr.POST_RATE)
 
+    def test_deep_json_is_400(self):
+        deep = "[" * 30000 + "]" * 30000
+        req = urllib.request.Request(self.base + "/api/send", data=deep.encode(), method="POST",
+                                     headers={"Authorization": "Bearer " + self.bob})
+        with self.assertRaises(urllib.error.HTTPError) as cm:
+            urllib.request.urlopen(req, timeout=10)
+        self.assertEqual(cm.exception.code, 400)
+        cm.exception.close()
+
     def test_bad_requests(self):
         self.assertEqual(call(self.base, "/api/messages?after=abc", self.key)[0], 400)
         with socket.create_connection(("127.0.0.1", self.srv.server_address[1])) as s:
@@ -451,8 +460,8 @@ class StorageTests(unittest.TestCase):
 class FakeHost:
     """悪意のあるホストのふり。決めた JSON を返す。"""
 
-    def __init__(self, routes):
-        routes_ = routes
+    def __init__(self, routes, headers=None):
+        routes_, headers_ = routes, headers or {}
 
         class H(BaseHTTPRequestHandler):
             def log_message(self, *a):
@@ -462,6 +471,8 @@ class FakeHost:
                 route = routes_.get(self.path.split("?")[0], {})
                 status, body = route if isinstance(route, tuple) else (200, json.dumps(route).encode())
                 self.send_response(status)
+                for k, v in headers_.items():
+                    self.send_header(k, v.decode() if isinstance(v, bytes) else v)
                 self.send_header("Content-Type", "application/json")
                 self.send_header("Content-Length", str(len(body)))
                 self.end_headers()
@@ -549,6 +560,46 @@ class MaliciousHostTests(unittest.TestCase):
             cm.exception.close()
         finally:
             host.close()
+
+    def test_deeply_nested_json(self):
+        class Resp:
+            def __init__(self, b):
+                self.b = b
+
+            def read(self, n=-1):
+                return self.b
+        deep = b"[" * 100000 + b"]" * 100000
+        with self.assertRaises(ValueError):                        # RecursionError ではなく ValueError
+            cr.read_json(Resp(deep), cr.MAX_RESPONSE)
+
+    def test_redirects_are_not_followed(self):
+        hits = []
+
+        class Target(BaseHTTPRequestHandler):
+            def log_message(self, *a):
+                pass
+
+            def do_GET(self):
+                hits.append(self.headers.get("Authorization"))
+                self.send_response(200)
+                self.end_headers()
+        target = ThreadingHTTPServer(("127.0.0.1", 0), Target)
+        threading.Thread(target=target.serve_forever, daemon=True).start()
+        loc = f"http://127.0.0.1:{target.server_address[1]}/private-service".encode()
+        host = FakeHost({"/api/messages": (302, b""), "/api/me": (302, b"")}, headers={"Location": loc})
+        try:
+            ag = object.__new__(cr.Agent)
+            ag.base, ag.key = host.base, "SECRET"
+            with self.assertRaises(urllib.error.HTTPError) as cm:
+                ag.api("GET", "/api/messages")
+            cm.exception.close()
+            with self.assertRaises(SystemExit):
+                cr.cmd_join(argparse.Namespace(url=host.base + "/#key=SECRET", key=None, name=None))
+            self.assertEqual(hits, [])                             # 転送先には、一度もアクセスしない
+        finally:
+            host.close()
+            target.shutdown()
+            target.server_close()
 
     def test_huge_timestamp(self):
         m = cr.Agent._clean_msg({"seq": 1, "ts": 10 ** 400, "name": "bob", "kind": "human", "text": "x"})
@@ -747,6 +798,20 @@ class PanelTests(unittest.TestCase):
         self.assertEqual(call(self.base, "/api/state?v=-1", headers={"X-Token": self.panel.token})[0], 200)
         # DNS リバインディング: 別の名前で来た要求は断る
         self.assertEqual(call(self.base, "/", headers={"Host": "evil.example:80"})[0], 403)
+
+    def test_turn_ids_are_never_reused(self):
+        ids = [self.panel.new_turn([])["id"] for _ in range(520)]
+        self.assertEqual(len(ids), len(set(ids)))                 # 古いターンを消しても、番号は重ならない
+        self.assertLessEqual(len(self.panel.turns), 500)
+
+    def test_deep_json_body_is_400(self):
+        deep = b"[" * 50000 + b"]" * 50000
+        req = urllib.request.Request(self.base + "/api/decide", data=deep, method="POST",
+                                     headers={"X-Token": self.panel.token, "Content-Type": "application/json"})
+        with self.assertRaises(urllib.error.HTTPError) as cm:
+            urllib.request.urlopen(req, timeout=10)
+        self.assertEqual(cm.exception.code, 400)
+        cm.exception.close()
 
     def test_approval_stops_when_room_unreachable(self):
         self.panel.agent.keep_floor = lambda: None                  # 部屋と連絡がつかない
