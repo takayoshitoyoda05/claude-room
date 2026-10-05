@@ -19,6 +19,7 @@ import secrets
 import shutil
 import socket
 import subprocess
+import tempfile
 import sys
 import threading
 import time
@@ -29,7 +30,7 @@ from http.server import BaseHTTPRequestHandler, ThreadingHTTPServer
 from pathlib import Path
 from urllib.parse import parse_qs, quote, urlparse
 
-__version__ = "0.1.0"
+__version__ = "0.2.0"
 REPO_URL = "https://github.com/takayoshitoyoda05/claude-room"
 DATA_DIR = Path(os.environ.get("CLAUDE_ROOM_HOME", Path.home() / ".claude-room"))
 MAX_TEXT = 20000
@@ -50,8 +51,38 @@ CODEX_DISABLE = ["shell_tool", "unified_exec", "code_mode_host", "view_image", "
                  "multi_agent", "hooks", "memories", "skill_search", "skill_mcp_dependency_install", "tool_suggest",
                  "goals"]
 CODEX_MUST_DISABLE = ["shell_tool", "unified_exec"]   # これを切れない版の Codex では動かさない
-NAME_RE = re.compile(r"[\w\-.]{1,40}")
+NAME_RE = re.compile(r"(?![.\-])[\w\-.]{1,40}")          # 名前全般（先頭に . や - は使えない）
+HUMAN_MAX = 32                                             # 人間の名前。AI の名前（claude-<名前>）が 40 文字に収まるように
+MAX_HISTORY = 5000                                         # メモリに置く発言の数
+MAX_FETCH = 500                                            # 1 回で返す発言の数
+POST_RATE = 30                                             # 1 人（招待）あたり、1 分に投稿できる回数
 STATUSES = {"idle", "thinking", "checking", "awaiting"}
+
+
+def valid_human(name):
+    """人間の名前として使えるか。AI の名前（claude-・codex- で始まる）や system とは重ならないようにする。"""
+    return (isinstance(name, str) and len(name) <= HUMAN_MAX and bool(NAME_RE.fullmatch(name))
+            and name != "system" and not any(name.startswith(p + "-") for p in AI_KINDS))
+
+
+def ai_name(product, human):
+    return f"{product}-{human}"
+
+
+def ai_product(name):
+    """AI の名前なら、その種類（claude / codex）。人間の名前なら None。"""
+    for p in AI_KINDS:
+        if name.startswith(p + "-") and valid_human(name[len(p) + 1:]):
+            return p
+    return None
+
+
+class Denied(Exception):
+    """要求を断るときの理由（HTTP の状態コードと、説明）。"""
+
+    def __init__(self, code, message):
+        super().__init__(message)
+        self.code = code
 
 if hasattr(sys.stdout, "reconfigure"):
     sys.stdout.reconfigure(errors="replace")
@@ -78,6 +109,7 @@ class Room:
         self.version = 0
         self.invite_bases = []
         self.host_name = ""
+        self._cids = {}             # 発言の ID -> 発言（二重投稿を防ぐ）
         if log_path.exists():
             with open(log_path, encoding="utf-8") as f:
                 for line in f:
@@ -85,6 +117,7 @@ class Room:
                         self.messages.append(json.loads(line))
                     except ValueError:
                         pass
+            del self.messages[:-MAX_HISTORY]
 
     def _bump(self):
         self.version += 1
@@ -93,8 +126,8 @@ class Room:
     def _last_seq(self):
         return self.messages[-1]["seq"] if self.messages else 0
 
-    def since(self, after):
-        return [m for m in self.messages if m["seq"] > after]
+    def since(self, after, limit=MAX_FETCH):
+        return [m for m in self.messages if m["seq"] > after][-limit:]
 
     def state(self):
         now = time.time()
@@ -109,11 +142,38 @@ class Room:
             "invite_bases": self.invite_bases,
         }
 
-    def post(self, name, kind, text):
+    def post(self, name, kind, text, cid=None, check=None):
+        """発言を部屋に加える。AI の発言は、発言権を持ち、止められていないときだけ受け付ける。
+
+        check: 招待が取り消されていないかの確認。取り消しと同じロックの中で確かめる（すれ違いをなくす）。
+        cid: 送り手が付ける発言の ID。同じ cid の再送は、二重に投稿しない。
+        """
         with self.cond:
+            if check is not None and not check():
+                raise Denied(401, "この招待は取り消されました")
+            if cid and cid in self._cids:
+                return self._cids[cid]
+            if kind in AI_KINDS:
+                now = time.time()
+                a = self.agents.get(name)
+                if self.paused or self.limit_hit() or (a and a["muted"]):
+                    raise Denied(409, "AI は止められています")
+                if not (self.floor and self.floor[0] == name and self.floor[1] > now):
+                    raise Denied(409, "発言権がありません")
             msg = {"seq": self._last_seq() + 1, "ts": time.time(), "name": name,
                    "kind": kind, "text": text}
+            try:     # 先にログへ書く。書けなければ、メモリにも加えない（ログと食い違わないように）
+                with open(self.log_path, "a", encoding="utf-8") as f:
+                    f.write(json.dumps(msg, ensure_ascii=False) + "\n")
+            except OSError as e:
+                raise Denied(507, f"ログを書けません: {e}")
             self.messages.append(msg)
+            if len(self.messages) > MAX_HISTORY:
+                del self.messages[:len(self.messages) - MAX_HISTORY]
+            if cid:
+                self._cids[cid] = msg
+                while len(self._cids) > 2000:
+                    self._cids.pop(next(iter(self._cids)))
             if kind == "human":
                 self.auto_turns = 0
             elif kind in AI_KINDS:
@@ -122,8 +182,6 @@ class Room:
                 self.floor = None
             if name in self.agents:
                 self.agents[name]["status"] = "idle"
-            with open(self.log_path, "a", encoding="utf-8") as f:
-                f.write(json.dumps(msg, ensure_ascii=False) + "\n")
             self._bump()
             return msg
 
@@ -196,6 +254,7 @@ class HardenedServer(ThreadingHTTPServer):
         self._streams = 0
         self._pending = {}           # 要求の受け取りが終わっていない接続 -> 受け付けた時刻
         self._fails = {}             # 送信元 -> 鍵を間違えた時刻のリスト
+        self._posts = {}             # 投稿した人（招待の ID か host）-> 投稿した時刻のリスト
         self._warned = 0.0
         threading.Thread(target=self._reaper, daemon=True).start()
 
@@ -255,6 +314,17 @@ class HardenedServer(ThreadingHTTPServer):
         with self._lock:
             self._streams -= 1
 
+    def rate_ok(self, who):
+        """1 人あたり、1 分に POST_RATE 回まで投稿できる。"""
+        with self._lock:
+            now = time.time()
+            recent = [t for t in self._posts.get(who, []) if now - t < 60]
+            ok = len(recent) < POST_RATE
+            if ok:
+                recent.append(now)
+            self._posts[who] = recent
+            return ok
+
     def too_many_fails(self, ip):
         with self._lock:
             now = time.time()
@@ -273,6 +343,16 @@ class HardenedServer(ThreadingHTTPServer):
                 self._warned = now
         if warn:
             log(f"[警告] 鍵の間違いが続いています（送信元 {ip}）。しばらく断ります")
+
+
+def _security_headers(handler, nonce):
+    """ページに付ける守り: スクリプトはこのページのものだけ、ほかのサイトの枠に入れさせない。"""
+    handler.send_header("Content-Security-Policy",
+                        f"default-src 'none'; script-src 'nonce-{nonce}'; style-src 'unsafe-inline'; "
+                        "connect-src 'self'; img-src 'self' data:; base-uri 'none'; frame-ancestors 'none'")
+    handler.send_header("X-Frame-Options", "DENY")
+    handler.send_header("X-Content-Type-Options", "nosniff")
+    handler.send_header("Referrer-Policy", "no-referrer")
 
 
 def _sha256(text):
@@ -301,9 +381,12 @@ class Invites:
             pass
         tmp.replace(self.path)
 
-    def create(self, name):
-        if not NAME_RE.fullmatch(name) or name == "system":
-            raise ValueError("名前に使えるのは、文字・数字・- _ . の 40 文字までです")
+    def create(self, name, reserved=()):
+        if not valid_human(name):
+            raise ValueError(f"名前に使えるのは、文字・数字・- _ . の {HUMAN_MAX} 文字までです"
+                             "（先頭に . と - は使えず、claude- と codex- で始まる名前も使えません）")
+        if name in reserved:
+            raise ValueError(f"{name} はホストの名前なので、招待には使えません")
         with self.lock:
             if any(i["name"] == name and not i["revoked"] for i in self.items):
                 raise ValueError(f"{name} への招待は、すでにあります（作り直すなら、先に取り消してください）")
@@ -359,11 +442,13 @@ def make_handler(room, key, invites):
         def log_message(self, *a):
             pass
 
-        def _send(self, code, body, ctype):
+        def _send(self, code, body, ctype, nonce=None):
             self.send_response(code)
             self.send_header("Content-Type", ctype)
             self.send_header("Content-Length", str(len(body)))
             self.send_header("Cache-Control", "no-store")
+            if nonce:
+                _security_headers(self, nonce)
             self.end_headers()
             self.wfile.write(body)
 
@@ -396,6 +481,13 @@ def make_handler(room, key, invites):
             """招待された人は、自分と自分の AI の名前でしか、発言・操作できない（なりすまし防止）。"""
             return self.who["role"] == "host" or name in guest_names(self.who["name"])
 
+        def _still_valid(self):
+            """招待が取り消されていないか（ホストは常に有効）。"""
+            return self.who["role"] == "host" or invites.is_active(self.who["id"])
+
+        def _check(self):
+            return None if self.who["role"] == "host" else (lambda: invites.is_active(self.who["id"]))
+
         def _body(self):
             n = int(self.headers.get("Content-Length") or 0)
             if n < 0 or n > 4 * MAX_TEXT:
@@ -412,7 +504,9 @@ def make_handler(room, key, invites):
             u = urlparse(self.path)
             qs = parse_qs(u.query)
             if u.path == "/":
-                return self._send(200, PAGE.replace("__REPO_URL__", REPO_URL).encode(), "text/html; charset=utf-8")
+                nonce = secrets.token_urlsafe(12)
+                return self._send(200, PAGE.replace("__REPO_URL__", REPO_URL).replace("__NONCE__", nonce).encode(),
+                                  "text/html; charset=utf-8", nonce=nonce)
             if u.path == "/api/ping":
                 return self._json(200, {"ok": True})
             if not self._authed():
@@ -431,12 +525,12 @@ def make_handler(room, key, invites):
             if u.path == "/api/wait":
                 name, owner = qs.get("name", [""])[0], qs.get("owner", [""])[0]
                 if name:
-                    if not (NAME_RE.fullmatch(name) and NAME_RE.fullmatch(owner)):
-                        return self._json(400, {"error": "bad name"})
-                    if not (self._may_act_as(name) and self._may_act_as(owner)):
-                        return self._json(403, {"error": "この招待では、その名前を使えません"})
                     product = qs.get("agent", ["claude"])[0]
-                    room.heartbeat(name, owner, product if product in AI_KINDS else "claude")
+                    if product not in AI_KINDS or not valid_human(owner) or name != ai_name(product, owner):
+                        return self._json(400, {"error": "bad name"})
+                    if not self._may_act_as(name):
+                        return self._json(403, {"error": "この招待では、その名前を使えません"})
+                    room.heartbeat(name, owner, product)
                 v = int(qs.get("v", ["-1"])[0])
                 timeout = max(0.0, min(float(qs.get("timeout", ["25"])[0]), 50))
                 if not self.server.begin_stream(self.connection):
@@ -444,6 +538,8 @@ def make_handler(room, key, invites):
                 try:
                     with room.cond:
                         room.cond.wait_for(lambda: room.version != v, timeout=timeout)
+                        if not self._still_valid():
+                            return self._json(401, {"error": "この招待は取り消されました"})
                         return self._json(200, {"messages": room.since(after), "state": room.state()})
                 finally:
                     self.server.end_stream()
@@ -471,10 +567,10 @@ def make_handler(room, key, invites):
             v = -1
             try:
                 while True:
-                    if self.who["role"] == "guest" and not invites.is_active(self.who["id"]):
-                        break   # 招待が取り消されたら、その場で切る
                     with room.cond:
                         room.cond.wait_for(lambda: room.version != v, timeout=15)
+                        if not self._still_valid():
+                            break
                         msgs, st, v = room.since(after), room.state(), room.version
                     out = []
                     for m in msgs:
@@ -506,20 +602,34 @@ def make_handler(room, key, invites):
                 return self._json(400, {"error": "bad body"})
             if not isinstance(d, dict):
                 return self._json(400, {"error": "bad body"})
+            if not self._still_valid():      # 本文を受け取る間に取り消されていないか
+                return self._json(401, {"error": "この招待は取り消されました"})
             name = str(d.get("name") or d.get("by") or "").strip()
             if u.path.startswith("/api/invites"):
                 return self._invites(u.path, d)
             if name and not NAME_RE.fullmatch(name):
-                return self._json(400, {"error": "名前に使えるのは、文字・数字・- _ . の 40 文字までです"})
+                return self._json(400, {"error": "名前に使えるのは、文字・数字・- _ . です（先頭に . と - は使えません）"})
             if name and not self._may_act_as(name):
                 return self._json(403, {"error": "この招待では、その名前を使えません"})
-            if u.path == "/api/send":
+            try:
+                return self._post_action(u.path, d, name)
+            except Denied as e:
+                return self._json(e.code, {"error": str(e)})
+
+        def _post_action(self, path, d, name):
+            if path == "/api/send":
                 text = str(d.get("text") or "").strip()
                 kind = d.get("kind") if d.get("kind") in ("human",) + AI_KINDS else "human"
                 if not name or not text or name == "system":
                     return self._json(400, {"error": "name and text required"})
-                return self._json(200, room.post(name, kind, text[:MAX_TEXT]))
-            if u.path == "/api/control":
+                # 札（kind）と名前を一致させる: AI の発言は claude-<名前>/codex-<名前> だけ、人間は人間の名前だけ
+                if (ai_product(name) or "human") != kind:
+                    return self._json(400, {"error": "名前と発言の種類が合いません"})
+                if not self.server.rate_ok(self.who.get("id", "host")):
+                    return self._json(429, {"error": "投稿が多すぎます。少し待ってください"})
+                cid = str(d.get("cid") or "")[:64] or None
+                return self._json(200, room.post(name, kind, text[:MAX_TEXT], cid=cid, check=self._check()))
+            if path == "/api/control":
                 notes = []
                 with room.cond:
                     if "paused" in d and bool(d["paused"]) != room.paused:
@@ -542,13 +652,15 @@ def make_handler(room, key, invites):
                     room.post("system", "system", f"{name or self.who.get('name') or '誰か'}が{n}")
                 with room.cond:
                     return self._json(200, room.state())
-            if u.path == "/api/floor":
+            if path in ("/api/floor", "/api/status") and not ai_product(name):
+                return self._json(400, {"error": "AI の名前が必要です"})
+            if path == "/api/floor":
                 if d.get("action") == "claim":
                     ok, st = room.claim(name)
                     return self._json(200, {"ok": ok, "state": st})
                 room.release(name)
                 return self._json(200, {"ok": True})
-            if u.path == "/api/status":
+            if path == "/api/status":
                 status = str(d.get("status") or "idle")
                 if status not in STATUSES:
                     return self._json(400, {"error": "bad status"})
@@ -561,12 +673,13 @@ def make_handler(room, key, invites):
                 return self._json(403, {"error": "招待を作ったり取り消したりできるのは、ホストだけです"})
             if path == "/api/invites":
                 try:
-                    item, inv_key = invites.create(str(d.get("name") or "").strip())
+                    item, inv_key = invites.create(str(d.get("name") or "").strip(), reserved={room.host_name})
                 except ValueError as e:
                     return self._json(400, {"error": str(e)})
                 return self._json(200, {"invite": item, "key": inv_key, "bases": room.invite_bases})
             if path == "/api/invites/revoke":
-                item = invites.revoke(str(d.get("id") or d.get("name") or ""))
+                with room.cond:     # 投稿の受け付けと同じロックの中で取り消す（すれ違いをなくす）
+                    item = invites.revoke(str(d.get("id") or d.get("name") or ""))
                 if not item:
                     return self._json(404, {"error": "その招待は見つからないか、すでに取り消されています"})
                 room.kick(guest_names(item["name"]))
@@ -696,7 +809,7 @@ def load_key(rotate):
 # ---------------------------------------------------------------- agent
 
 SYSTEM_PROMPT = """\
-あなたは「{me}」です。{owner} さんの AI（{product}）として、Claude Room のチャットルーム「{room}」に参加しています。
+あなたは「{me}」です。{owner} さんの AI（{product}）として、Claude Room のチャットルームに参加しています。
 ルームには、人間（{owner} さん、相手の人）と、相手の人の AI がいます。ほかの参加者は、ルームのメッセージを通してしか、あなたとやり取りできません。
 
 - あなたの出力は、そのままルームに投稿されます。投稿する本文だけを書いてください（「{me}:」のような前置きは不要）
@@ -735,7 +848,11 @@ CHECK_SYSTEM = """\
 
 
 class Stopped(Exception):
-    pass
+    """人間に止められた。"""
+
+
+class Kicked(Exception):
+    """部屋から外された（招待の取り消しなど）。"""
 
 
 def norm(s):
@@ -789,16 +906,16 @@ class Panel:
         handler = self._handler()
         for p in [port] + [0] * 3:
             try:
-                srv = ThreadingHTTPServer(("127.0.0.1", p), handler)
+                srv = HardenedServer(("127.0.0.1", p), handler)     # 部屋と同じ守り（接続数・時間切れ）
                 break
             except OSError:
                 continue
         else:
             log("[警告] 代理人パネルを開けませんでした")
             return
-        srv.daemon_threads = True
         threading.Thread(target=srv.serve_forever, daemon=True).start()
-        self.url = f"http://localhost:{srv.server_address[1]}/#t={self.token}"
+        self.port = srv.server_address[1]
+        self.url = f"http://localhost:{self.port}/#t={self.token}"
 
     def _bump(self):
         self.version += 1
@@ -864,49 +981,82 @@ class Panel:
         panel = self
 
         class H(BaseHTTPRequestHandler):
+            server_version = "claude-room"
+            sys_version = ""
+            timeout = SOCKET_TIMEOUT
+
             def log_message(self, *a):
                 pass
 
-            def _send(self, code, body, ctype):
+            def _send(self, code, body, ctype, nonce=None):
                 self.send_response(code)
                 self.send_header("Content-Type", ctype)
                 self.send_header("Content-Length", str(len(body)))
                 self.send_header("Cache-Control", "no-store")
+                if nonce:
+                    _security_headers(self, nonce)
                 self.end_headers()
                 self.wfile.write(body)
 
             def _json(self, code, obj):
                 self._send(code, json.dumps(obj, ensure_ascii=False).encode(), "application/json; charset=utf-8")
 
+            def _host_ok(self):
+                # DNS リバインディング対策: このパネルは localhost / 127.0.0.1 の名前でしか受け付けない
+                host = (self.headers.get("Host") or "").lower()
+                return host in (f"localhost:{panel.port}", f"127.0.0.1:{panel.port}")
+
             def _ok(self):
                 return secrets.compare_digest(self.headers.get("X-Token", "").encode(), panel.token.encode())
 
             def do_GET(self):
+                if not self._host_ok():
+                    return self._json(403, {"error": "bad host"})
                 u = urlparse(self.path)
                 if u.path == "/":
-                    return self._send(200, PANEL_PAGE.encode(), "text/html; charset=utf-8")
+                    nonce = secrets.token_urlsafe(12)
+                    return self._send(200, PANEL_PAGE.replace("__NONCE__", nonce).encode(),
+                                      "text/html; charset=utf-8", nonce=nonce)
                 if not self._ok():
                     return self._json(401, {"error": "bad token"})
                 if u.path == "/api/state":
-                    v = int(parse_qs(u.query).get("v", ["-1"])[0])
-                    with panel.lock:
-                        panel.lock.wait_for(lambda: panel.version != v, timeout=20)
-                        ag = panel.agent
-                        return self._json(200, {
-                            "version": panel.version, "me": ag.me, "owner": ag.owner, "room": ag.room,
-                            "policy": ag.policy_text, "secrets": ag.secret_items, "words": ag.words,
-                            "guard": ag.args.guard, "confirm": ag.args.confirm,
-                            "turns": panel.turns[-60:], "stats": panel.stats()})
+                    try:
+                        v = int(parse_qs(u.query).get("v", ["-1"])[0])
+                    except ValueError:
+                        return self._json(400, {})
+                    if not self.server.begin_stream(self.connection):
+                        return self._json(503, {"error": "busy"})
+                    try:
+                        with panel.lock:
+                            panel.lock.wait_for(lambda: panel.version != v, timeout=20)
+                            ag = panel.agent
+                            return self._json(200, {
+                                "version": panel.version, "me": ag.me, "owner": ag.owner, "room": ag.room,
+                                "policy": ag.policy_text, "secrets": ag.secret_items, "words": ag.words,
+                                "guard": ag.args.guard, "confirm": ag.args.confirm,
+                                "turns": panel.turns[-60:], "stats": panel.stats()})
+                    finally:
+                        self.server.end_stream()
                 self._json(404, {})
 
             def do_POST(self):
+                if not self._host_ok():
+                    return self._json(403, {"error": "bad host"})
                 if not self._ok():
                     return self._json(401, {"error": "bad token"})
-                n = int(self.headers.get("Content-Length") or 0)
-                d = json.loads(self.rfile.read(min(n, 4 * MAX_TEXT)) or b"{}")
+                try:
+                    n = int(self.headers.get("Content-Length") or 0)
+                    if n < 0 or n > 4 * MAX_TEXT:
+                        raise ValueError
+                    d = json.loads(self.rfile.read(n) or b"{}")
+                    if not isinstance(d, dict):
+                        raise ValueError
+                    turn = int(d.get("turn", 0))
+                except (ValueError, TypeError):
+                    return self._json(400, {})
                 if urlparse(self.path).path == "/api/decide" and d.get("action") in ("send", "rewrite", "discard"):
                     with panel.lock:
-                        panel.decisions[int(d.get("turn", 0))] = {
+                        panel.decisions[turn] = {
                             "action": d["action"], "text": str(d.get("text") or "")[:MAX_TEXT]}
                         panel._bump()
                     return self._json(200, {"ok": True})
@@ -918,10 +1068,13 @@ class Panel:
 class Agent:
     def __init__(self, base, key, name, args):
         self.base, self.key = base.rstrip("/"), key
+        if not valid_human(name):
+            sys.exit(f"名前「{name}」は使えません（文字・数字・- _ . の {HUMAN_MAX} 文字まで。"
+                     "先頭に . と - は使えず、claude- と codex- で始まる名前も使えません）")
         self.owner = name
         self.product = args.agent
         self.label = PRODUCT[self.product]
-        self.me = name if name.startswith(self.product) else f"{self.product}-{name}"
+        self.me = ai_name(self.product, name)
         self.args = args
         self.bin = shutil.which(self.product)
         if not self.bin:
@@ -941,7 +1094,11 @@ class Agent:
         # AI が読めるのは作業ディレクトリの中だけ。既定は専用の空のフォルダにして、
         # 相手に仕向けられても手元のファイルを読み上げないようにする
         if not args.workdir:
-            args.workdir = str(DATA_DIR / "work" / self.me)
+            root = (DATA_DIR / "work").resolve()
+            wd = (root / self.me).resolve()
+            if root not in wd.parents:        # 念のため: 専用の場所の外に出ないこと
+                sys.exit("作業フォルダの場所がおかしいので中止します")
+            args.workdir = str(wd)
         Path(args.workdir).mkdir(parents=True, exist_ok=True)
         if self.product == "claude":
             if args.tools is None:
@@ -952,8 +1109,12 @@ class Agent:
                 log("[注意] Codex では --tools は使えません。ファイルは一切読ませない設定で動かします")
             self._setup_codex()
         self.panel = Panel(self, args.panel_port)
-        DATA_DIR.mkdir(parents=True, exist_ok=True)
+        if not self.panel.url and (self.guarded or args.confirm):
+            sys.exit("代理人パネルを開けませんでした。確認が必要になったときに操作できないので、中止します"
+                     "（--panel-port で別のポートを指定してください）")
         self.record_path = DATA_DIR / f"agent-{self.me}.jsonl"
+        self._record_warned = False
+        self._q = f"&name={quote(self.me)}&owner={quote(self.owner)}&agent={self.product}"
 
     def _setup_claude(self):
         # --safe-mode: CLAUDE.md・MCP・フック・プラグインを読み込まない（読み込むと、その中身が相手に漏れうる）
@@ -962,10 +1123,10 @@ class Agent:
                                        text=True, timeout=30).stdout
         except (OSError, subprocess.SubprocessError):
             help_text = ""
-        self.safe_mode = "--safe-mode" in help_text
-        if not self.safe_mode:
-            log("[警告] この Claude Code は --safe-mode に対応していません。CLAUDE.md などの中身が相手に漏れる恐れが"
-                "あります。Claude Code を更新してください（claude update）")
+        # --append-system-prompt-file は、ヘルプには「--append-system-prompt[-file]」と書かれている
+        if "--safe-mode" not in help_text or not re.search(r"append-system-prompt(-file|\[-file\])", help_text):
+            sys.exit("この Claude Code は --safe-mode などに対応していないため、CLAUDE.md などの中身が相手に漏れる"
+                     "恐れがあります。Claude Code を更新してください（claude update）")
 
     def _setup_codex(self):
         """Codex を、部屋専用の設定で動かす準備をする。
@@ -974,7 +1135,7 @@ class Agent:
         そこで CODEX_HOME を部屋専用のフォルダにし、ログイン情報（auth.json）だけをシンボリックリンクで共有する
         （Codex は auth.json をその場で上書きするので、トークンが更新されても普段の Codex のログインは切れない）。
         """
-        home = DATA_DIR / "codex-home"
+        home = DATA_DIR / "codex-home" / self.me
         home.mkdir(parents=True, exist_ok=True)
         auth = home / "auth.json"
         src = Path(os.environ.get("CODEX_HOME") or Path.home() / ".codex") / "auth.json"
@@ -990,6 +1151,7 @@ class Agent:
         for n in ("AGENTS.md", "AGENTS.override.md"):
             if (home / n).exists():
                 sys.exit(f"{home / n} があります。その中身が相手に漏れる恐れがあるので、消してから参加してください")
+        self.codex_home = home
         self.codex_env = dict(os.environ, CODEX_HOME=str(home))
         # 切る機能のうち、この版の Codex にあるものだけを指定する（ない名前を渡すと失敗する版があるため）
         try:
@@ -1009,22 +1171,70 @@ class Agent:
             self.base + path, method=method,
             data=json.dumps(data).encode() if data is not None else None,
             headers={"Authorization": "Bearer " + self.key, "Content-Type": "application/json"})
-        with urllib.request.urlopen(req, timeout=timeout) as r:
-            return json.loads(r.read())
+        try:
+            with urllib.request.urlopen(req, timeout=timeout) as r:
+                return json.loads(r.read())
+        except urllib.error.HTTPError as e:
+            if e.code in (401, 403):
+                raise Kicked(_http_error(e))
+            raise
+
+    # ホストは信頼しない: ホストから来た値は、型と形式を確かめてから使う
+    @staticmethod
+    def _clean_msg(m):
+        if not isinstance(m, dict):
+            return None
+        seq, name, kind, text, ts = (m.get(k) for k in ("seq", "name", "kind", "text", "ts"))
+        if type(seq) is not int or seq < 1 or kind not in ("human", "system") + AI_KINDS:
+            return None
+        if not isinstance(name, str) or not (name == "system" if kind == "system" else NAME_RE.fullmatch(name)):
+            return None
+        if not isinstance(text, str) or len(text) > MAX_TEXT:
+            return None
+        ts = float(ts) if isinstance(ts, (int, float)) and not isinstance(ts, bool) else 0.0
+        return {"seq": seq, "ts": ts, "name": name, "kind": kind, "text": text}
+
+    @staticmethod
+    def _clean_state(st):
+        if not isinstance(st, dict):
+            raise ValueError("ホストからの状態の形がおかしい")
+
+        def num(k):
+            v = st.get(k)
+            return v if type(v) is int and v >= 0 else 0
+        agents = [{"name": a["name"], "muted": a.get("muted") is True}
+                  for a in st.get("agents") or [] if isinstance(a, dict)
+                  and isinstance(a.get("name"), str) and NAME_RE.fullmatch(a["name"])]
+        room = st.get("room")
+        version = st.get("version")
+        return {"room": room if isinstance(room, str) and valid_human(room) else "room",
+                "version": version if type(version) is int else -1,
+                "paused": st.get("paused") is True, "max_turns": num("max_turns"),
+                "auto_turns": num("auto_turns"), "agents": agents}
 
     def _absorb(self, r):
-        for m in r["messages"]:
+        if not isinstance(r, dict) or not isinstance(r.get("messages"), list):
+            raise ValueError("ホストからの応答の形がおかしい")
+        for raw in r["messages"]:
+            m = self._clean_msg(raw)
+            if m is None:
+                log("[注意] 形のおかしい発言を受け取ったので、捨てました")
+                continue
             if not self.history or m["seq"] > self.history[-1]["seq"]:
                 self.history.append(m)
-        self.v = r["state"]["version"]
-        self.room = r["state"]["room"]
-        return r["state"]
+        del self.history[:-MAX_HISTORY]
+        st = self._clean_state(r.get("state"))
+        self.v = st["version"]
+        self.room = st["room"]
+        return st
 
     def run(self):
         try:
             self._absorb(self.api("GET", "/api/messages?after=0"))
+        except Kicked:
+            sys.exit("この鍵では入れません（招待が取り消されたか、URL が違います）")
         except urllib.error.HTTPError as e:
-            sys.exit("鍵が違います（401）" if e.code == 401 else f"接続できません: {e}")
+            sys.exit(f"接続できません: {e}")
         except OSError as e:
             sys.exit(f"接続できません: {e}\n  （Tailscale がつながっているか、URL が正しいかを確かめてください）")
         # 参加より前の発言には返事をしない（最初の返答のときに背景として渡す）
@@ -1039,17 +1249,14 @@ class Agent:
                 f"（チェック: {'なし' if not self.guarded else self.args.guard}）")
         if self.panel.url:
             log(f"代理人パネル（あなただけが見る画面）: {self.panel.url}")
-        q = f"&name={quote(self.me)}&owner={quote(self.owner)}&agent={self.product}"
         while True:
             try:
                 last = self.history[-1]["seq"] if self.history else 0
-                st = self._absorb(self.api("GET", f"/api/wait?after={last}&v={self.v}&timeout=25{q}", timeout=60))
+                st = self._absorb(self.api("GET", f"/api/wait?after={last}&v={self.v}&timeout=25{self._q}",
+                                           timeout=60))
                 self.maybe_reply(st)
-            except urllib.error.HTTPError as e:
-                if e.code in (401, 403):
-                    sys.exit(f"部屋から外されました（招待が取り消されたか、鍵が無効になりました）: {_http_error(e)}")
-                log(f"[接続エラー] {e}  3 秒後に再接続します")
-                time.sleep(3)
+            except Kicked as e:
+                sys.exit(f"部屋から外されました（招待が取り消されたか、鍵が無効になりました）: {e}")
             except (OSError, ValueError) as e:
                 log(f"[接続エラー] {e}  3 秒後に再接続します")
                 time.sleep(3)
@@ -1061,10 +1268,16 @@ class Agent:
         return bool(st["paused"] or limit or (mine and mine["muted"]))
 
     def _halted_now(self):
-        return self._halted(self.api("GET", "/api/messages?after=999999999999")["state"])
+        # ついでに生存の合図（ハートビート）も送る。長く考えている間も「オフライン」にならないように
+        r = self.api("GET", f"/api/wait?after=999999999999&v=-2&timeout=0{self._q}", timeout=8)
+        return self._halted(self._clean_state(r.get("state") if isinstance(r, dict) else None))
 
     def keep_floor(self):
-        self.api("POST", "/api/floor", {"name": self.me, "action": "claim"})
+        """発言権の期限を延ばす（考えている・確認を待っている間に、ほかの AI が話し始めないように）。"""
+        try:
+            self.api("POST", "/api/floor", {"name": self.me, "action": "claim"}, timeout=8)
+        except (OSError, ValueError):
+            pass
 
     def _status(self, status):
         try:
@@ -1094,8 +1307,8 @@ class Agent:
             self.replied_upto = latest["seq"]
             return
         r = self.api("POST", "/api/floor", {"name": self.me, "action": "claim"})
-        self.v = r["state"]["version"]
-        if not r["ok"]:
+        self.v = self._clean_state(r.get("state") if isinstance(r, dict) else None)["version"]
+        if not (isinstance(r, dict) and r.get("ok") is True):
             return
         turn = None
         try:
@@ -1109,6 +1322,8 @@ class Agent:
             turn = self.panel.new_turn(talk)
             try:
                 reply = self.compose(turn, talk)
+            except Kicked:
+                raise
             except Stopped:
                 # 返事済みの印を進めないので、再開したらこの発言に答え直す
                 self.panel.set(turn, status="cancelled")
@@ -1123,18 +1338,39 @@ class Agent:
                 self.panel.set(turn, status="cancelled")
                 log("→ 人間に止められたので、投稿しませんでした")
                 return
-            self.replied_upto = upto
             if not reply or reply.strip() == PASS_TOKEN:
+                self.replied_upto = upto
                 self.panel.set(turn, status="pass" if reply else "discarded")
                 log("→ （発言なし）")
                 return
-            self.api("POST", "/api/send", {"name": self.me, "kind": self.product, "text": reply})
-            self.panel.set(turn, status="posted", final=reply)
-            log(f"→ 投稿しました（{len(reply)} 文字）")
+            if self._post_reply(reply):
+                self.replied_upto = upto        # 投稿できたときだけ、返事済みにする
+                self.panel.set(turn, status="posted", final=reply)
+                log(f"→ 投稿しました（{len(reply)} 文字）")
+            else:
+                self.panel.set(turn, status="cancelled")
         finally:
             self.api("POST", "/api/floor", {"name": self.me, "action": "release"})
             if turn is not None:
                 self._record(turn)
+
+    def _post_reply(self, reply):
+        """投稿する。通信が切れたら同じ ID で送り直す（二重には投稿されない）。"""
+        cid = secrets.token_hex(8)
+        for attempt in range(4):
+            try:
+                self.api("POST", "/api/send", {"name": self.me, "kind": self.product, "text": reply, "cid": cid})
+                return True
+            except urllib.error.HTTPError as e:
+                if e.code == 409:
+                    log(f"→ 投稿しませんでした（{_http_error(e)}）")
+                    return False
+                log(f"[投稿エラー] {_http_error(e)}")
+            except (OSError, ValueError) as e:
+                log(f"[投稿エラー] {e}  送り直します")
+            time.sleep(2 * (attempt + 1))
+        log("→ 投稿できませんでした。この発言には、あとで答え直します")
+        return False
 
     def compose(self, turn, talk):
         """下書き → 秘密チェック → 書き直し／持ち主の判断。投稿する文（または None / [PASS]）を返す。"""
@@ -1143,6 +1379,7 @@ class Agent:
         self.panel.step(turn, kind="draft", n=n, text=draft)
         auto_left = self.args.max_rewrites if self.args.guard == "auto" else 0
         while True:
+            self.keep_floor()
             if draft.strip() == PASS_TOKEN:
                 return draft
             verdict = None
@@ -1194,7 +1431,7 @@ class Agent:
         if hits:
             return {"ok": False, "by": "words", "reasons": [f"止める言葉「{w}」が入っています" for w in hits],
                     "quotes": hits, "hint": "その言葉と、それを推測させる表現を使わずに書く"}
-        recent = [m for m in self.history if m["kind"] != "system"][-12:]
+        recent = [m for m in self.history if m["kind"] != "system"][-30:]
         prompt = "\n".join([
             "【持ち主の非公開の設定】", self.policy_text, "",
             "【直前の会話】", *[self._fmt(m) for m in recent], "",
@@ -1203,24 +1440,30 @@ class Agent:
             text, _ = self._run_ai(prompt, CHECK_SYSTEM, model=self.args.check_model or self.args.model, checker=True)
             m = re.search(r"\{.*\}", text, re.S)
             res = json.loads(m.group(0)) if m else None
-            if not isinstance(res, dict) or "leak" not in res:
+            # leak は true か false だけを認める。それ以外（null・0・空など）は判定できなかったとみなして止める
+            if not isinstance(res, dict) or not isinstance(res.get("leak"), bool):
                 raise ValueError(f"判定を読めません: {text[:200]}")
         except Stopped:
             raise
         except Exception as e:  # noqa: BLE001 — 判定できないときは止める側に倒す
             return {"ok": False, "by": "error", "reasons": [f"チェックが動きませんでした（{str(e)[:150]}）"],
                     "quotes": [], "hint": ""}
-        return {"ok": not res.get("leak"), "by": "ai",
-                "reasons": [str(x) for x in res.get("reasons") or []][:5],
-                "quotes": [str(x) for x in res.get("quotes") or []][:5],
-                "hint": str(res.get("hint") or "")}
+        def strs(v):
+            return [str(x) for x in v][:5] if isinstance(v, list) else []
+        reasons = strs(res.get("reasons"))
+        if res["leak"] and not reasons:
+            reasons = ["（理由の説明なし）"]
+        return {"ok": res["leak"] is False, "by": "ai", "reasons": reasons,
+                "quotes": strs(res.get("quotes")), "hint": str(res.get("hint") or "")[:500]}
 
     def _record(self, turn):
         try:
             with open(self.record_path, "a", encoding="utf-8") as f:
                 f.write(json.dumps({k: v for k, v in turn.items() if k != "pending"}, ensure_ascii=False) + "\n")
-        except OSError:
-            pass
+        except OSError as e:
+            if not self._record_warned:
+                self._record_warned = True
+                log(f"[警告] 代理人の記録を書けません: {e}")
 
     def build_prompt(self, talk):
         parts = []
@@ -1244,26 +1487,32 @@ class Agent:
         return f"--- #{m['seq']} {m['name']}（{who}） ---\n{m['text']}"
 
     def ask_ai(self, prompt):
-        system = SYSTEM_PROMPT.format(me=self.me, owner=self.owner, room=self.room, product=self.label,
-                                      pass_token=PASS_TOKEN)
+        # 上位の指示には、ホストから来た文字列（部屋の名前など）を入れない。名前は検査済みのものだけ
+        system = SYSTEM_PROMPT.format(me=self.me, owner=self.owner, product=self.label, pass_token=PASS_TOKEN)
         if self.policy_text:
             system += AGENT_PROMPT.format(owner=self.owner, policy=self.policy_text)
         text, self.session = self._run_ai(prompt, system, model=self.args.model, resume=self.session)
         return re.sub(rf"^{re.escape(self.me)}\s*[:：]\s*", "", text)
 
     def _run_ai(self, prompt, system, model=None, resume=None, checker=False):
-        """AI を 1 回動かして (本文, 会話 ID) を返す。部屋が止められたら、その場でプロセスを止めて Stopped。"""
+        """AI を 1 回動かして (本文, 会話 ID) を返す。部屋が止められたら、その場でプロセスを止めて Stopped。
+
+        秘密の設定を含む指示は、起動引数ではなく、本人だけが読めるファイル（0600）で渡し、終わったら消す
+        （起動引数は、同じ PC のほかのプロセスから ps などで見えるため）。
+        """
         if self.product == "codex":
             return self._run_codex(prompt, system, model, resume, checker)
-        cmd = [self.bin, "-p", "--output-format", "json", "--tools", "" if checker else self.args.tools,
-               "--append-system-prompt", system]
-        if self.safe_mode:
-            cmd.append("--safe-mode")
-        if model:
-            cmd += ["--model", model]
-        if resume:
-            cmd += ["--resume", resume]
-        stdout, stderr, _ = self._run_process(cmd, prompt)
+        path = _private_file(system)
+        try:
+            cmd = [self.bin, "-p", "--safe-mode", "--output-format", "json",
+                   "--tools", "" if checker else self.args.tools, "--append-system-prompt-file", path]
+            if model:
+                cmd += ["--model", model]
+            if resume:
+                cmd += ["--resume", resume]
+            stdout, stderr, _ = self._run_process(cmd, prompt)
+        finally:
+            _remove(path)
         try:
             out = json.loads(stdout)
         except ValueError:
@@ -1271,15 +1520,24 @@ class Agent:
         if out.get("is_error"):
             raise RuntimeError(str(out.get("result"))[:500])
         cost = out.get("total_cost_usd")
-        if cost is not None:
+        if isinstance(cost, (int, float)):
             log(f"   （費用の目安: ${cost:.4f}）")
-        return (out.get("result") or "").strip(), out.get("session_id") or resume
+        return str(out.get("result") or "").strip(), out.get("session_id") or resume
+
+    def _codex_config(self, system):
+        """部屋専用の CODEX_HOME に、この 1 回分の設定を書く。部屋のルールは「開発者の指示」として渡す。"""
+        lines = ['sandbox_mode = "read-only"', 'web_search = "disabled"',
+                 # 値は TOML の文字列。JSON の文字列の書き方は、TOML の基本文字列としても正しい
+                 "developer_instructions = " + json.dumps(system, ensure_ascii=False), "", "[features]"]
+        lines += [f"{f} = false" for f in self.codex_disable]
+        path = self.codex_home / "config.toml"
+        fd = os.open(str(path), os.O_WRONLY | os.O_CREAT | os.O_TRUNC, 0o600)
+        with os.fdopen(fd, "w", encoding="utf-8") as f:
+            f.write("\n".join(lines) + "\n")
+        return path
 
     def _run_codex(self, prompt, system, model, resume, checker):
-        # 部屋のルールは「開発者の指示」として渡す（値は TOML として読まれるので、JSON の文字列で書く）
-        opts = ["--json", "--ignore-user-config", "--ignore-rules", "--skip-git-repo-check",
-                "-c", 'sandbox_mode="read-only"', "-c", 'web_search="disabled"',
-                "-c", "developer_instructions=" + json.dumps(system, ensure_ascii=False)]
+        opts = ["--json", "--ignore-rules", "--skip-git-repo-check"]
         for f in self.codex_disable:
             opts += ["--disable", f]
         if model:
@@ -1287,25 +1545,33 @@ class Agent:
         if checker:
             opts.append("--ephemeral")
         cmd = [self.bin, "exec", "resume", *opts, resume, "-"] if resume else [self.bin, "exec", *opts, "-"]
-        stdout, stderr, code = self._run_process(cmd, prompt, env=self.codex_env)
+        path = self._codex_config(system)
+        try:
+            stdout, stderr, code = self._run_process(cmd, prompt, env=self.codex_env)
+        finally:
+            _remove(path)
         thread, msgs, err, usage = None, [], None, None
         for line in stdout.splitlines():
             try:
                 e = json.loads(line)
             except ValueError:
                 continue
+            if not isinstance(e, dict):
+                continue
             t = e.get("type")
             if t == "thread.started":
                 thread = e.get("thread_id")
-            elif t == "item.completed" and (e.get("item") or {}).get("type") == "agent_message":
-                msgs.append(e["item"].get("text") or "")
+            elif t == "item.completed" and isinstance(e.get("item"), dict) \
+                    and e["item"].get("type") == "agent_message":
+                msgs.append(str(e["item"].get("text") or ""))
             elif t in ("error", "turn.failed"):
                 err = e.get("message") or (e.get("error") or {}).get("message") or str(e)
             elif t == "turn.completed":
                 usage = e.get("usage")
-        if not msgs:
+        # 途中で失敗したときは、途中の発言を最終の答えとして使わない
+        if err or code != 0 or not msgs:
             raise RuntimeError((err or stderr or f"Codex が応答しませんでした（終了コード {code}）").strip()[-500:])
-        if usage:
+        if isinstance(usage, dict):
             log(f"   （トークン: 入力 {usage.get('input_tokens')}・出力 {usage.get('output_tokens')}）")
         return msgs[-1].strip(), thread or resume
 
@@ -1314,7 +1580,18 @@ class Agent:
         p = subprocess.Popen(cmd, stdin=subprocess.PIPE, stdout=subprocess.PIPE, stderr=subprocess.PIPE,
                              text=True, encoding="utf-8", errors="replace", cwd=self.args.workdir,
                              start_new_session=posix, env=env)
+
+        def kill():
+            if posix:
+                try:
+                    os.killpg(p.pid, 9)
+                except OSError:
+                    p.kill()
+            else:
+                p.kill()
+            p.communicate()
         deadline = time.time() + self.args.timeout
+        last_renew = time.time()
         pending_input = prompt
         while True:
             try:
@@ -1325,20 +1602,40 @@ class Agent:
             stop = time.time() > deadline
             try:
                 stop = stop or self._halted_now()
+                if time.time() - last_renew > 60:
+                    self.keep_floor()
+                    last_renew = time.time()
+            except Kicked:
+                kill()
+                raise
             except (OSError, ValueError):
                 pass
             if stop:
-                if posix:
-                    try:
-                        os.killpg(p.pid, 9)
-                    except OSError:
-                        p.kill()
-                else:
-                    p.kill()
-                p.communicate()
+                kill()
                 if time.time() > deadline:
                     raise RuntimeError(f"{self.args.timeout} 秒たっても返答がありません")
                 raise Stopped()
+
+
+def _private_file(text):
+    """本人だけが読めるファイル（0600）に書いて、そのパスを返す。"""
+    d = DATA_DIR / "run"
+    d.mkdir(parents=True, exist_ok=True)
+    try:
+        d.chmod(0o700)
+    except OSError:
+        pass
+    fd, path = tempfile.mkstemp(dir=str(d), suffix=".txt")
+    with os.fdopen(fd, "w", encoding="utf-8") as f:
+        f.write(text)
+    return path
+
+
+def _remove(path):
+    try:
+        os.unlink(str(path))
+    except OSError:
+        pass
 
 
 # ---------------------------------------------------------------- cli
@@ -1371,16 +1668,23 @@ def print_invite(base, inv_key, name):
     print(f'      curl -O {raw} && python3 claude_room.py join "{url}"')
 
 
+def _room_name(v):
+    if not valid_human(v):
+        raise argparse.ArgumentTypeError("部屋の名前に使えるのは、文字・数字・- _ . です")
+    return v
+
+
 def cmd_host(a):
     key = load_key(a.new_key)
     log_path = DATA_DIR / f"{a.room}.jsonl"
     if a.fresh and log_path.exists():
         log_path.rename(log_path.with_name(f"{a.room}-{time.strftime('%Y%m%d-%H%M%S')}.jsonl"))
-    if not NAME_RE.fullmatch(a.name):
-        sys.exit("名前に使えるのは、文字・数字・- _ . の 40 文字までです")
+    if not valid_human(a.name):
+        sys.exit(f"名前に使えるのは、文字・数字・- _ . の {HUMAN_MAX} 文字までです"
+                 "（先頭に . と - は使えず、claude- と codex- で始まる名前も使えません）")
     room = Room(a.room, log_path, a.max_turns)
     room.host_name = a.name
-    invites = Invites(DATA_DIR / "invites.json")
+    invites = Invites(DATA_DIR / f"invites-{a.room}.json")    # 招待は部屋ごと
     if a.public:
         # 公開するときは 127.0.0.1 だけで待ち受け、Funnel 経由でだけ外から届くようにする
         up = serve(room, key, invites, ["127.0.0.1"], a.port)
@@ -1452,7 +1756,11 @@ def cmd_join(a):
     except OSError as e:
         sys.exit(f"接続できません: {e}\n  （ネットワークがつながっているか、URL が正しいかを確かめてください）")
     name = a.name or getpass.getuser()
+    if not isinstance(me, dict):
+        sys.exit("ホストからの応答の形がおかしいので、参加をやめます")
     if me.get("role") == "guest":
+        if not valid_human(me.get("name")):      # ホストは信頼しない: 名前を確かめてから使う
+            sys.exit("ホストから受け取った名前の形がおかしいので、参加をやめます")
         if a.name and a.name != me["name"]:
             log(f"[注意] この招待は {me['name']} さん用なので、{me['name']} として参加します")
         name = me["name"]
@@ -1496,7 +1804,7 @@ def main():
     sub = ap.add_subparsers(dest="cmd", required=True)
     h = sub.add_parser("host", help="部屋を開く（この PC が中継役）")
     add_agent_args(h)
-    h.add_argument("--room", default="room", help="部屋の名前（ログのファイル名にもなる）")
+    h.add_argument("--room", default="room", type=_room_name, help="部屋の名前（ログのファイル名にもなる）")
     h.add_argument("--port", type=int, default=8765)
     h.add_argument("--bind", action="append", help="待ち受けアドレス（既定: Tailscale のアドレスと 127.0.0.1）")
     h.add_argument("--max-turns", type=int, default=0,
@@ -1522,6 +1830,13 @@ def main():
     v.add_argument("--port", type=int, default=8765, help="部屋のポート（host で --port を変えたとき）")
     v.set_defaults(func=cmd_invite)
     a = ap.parse_args()
+    if hasattr(os, "umask"):
+        os.umask(0o077)          # 作るファイルとフォルダを、本人だけが読めるようにする
+    DATA_DIR.mkdir(parents=True, exist_ok=True)
+    try:
+        DATA_DIR.chmod(0o700)
+    except OSError:
+        pass
     try:
         a.func(a)
     except KeyboardInterrupt:
@@ -1627,9 +1942,13 @@ dialog pre{user-select:all}.btn.del{color:#c0392b}
   <div class="invrow"><input id="invName" maxlength="40" placeholder="相手の名前（例: bob）"><button class="btn primary" id="invCreate">招待を作る</button></div>
   <div id="invResult"></div>
   <h4 style="margin:16px 0 6px">発行した招待</h4><div id="invList"></div>
-  <div class="row"><button class="btn" onclick="this.closest('dialog').close()">閉じる</button></div></dialog>
-<script>
+  <div class="row"><button class="btn" data-act="close">閉じる</button></div></dialog>
+<script nonce="__NONCE__">
 const $=s=>document.querySelector(s);
+// CSP でインラインのクリック処理を禁じているので、ボタンの動作はここでまとめて登録する
+document.addEventListener('click',e=>{const b=e.target.closest('[data-act]');if(!b)return;const a=b.dataset.act;
+  if(a==='close')b.closest('dialog').close();else if(a==='resume')control({paused:false});
+  else if(a==='add5')control({add_turns:5});else if(a==='nolimit')control({max_turns:0})});
 const REPO='__REPO_URL__';
 const PRODUCT={claude:'Claude',codex:'Codex'};
 const store={get(k){try{return localStorage.getItem('cb.'+k)}catch(e){return null}},set(k,v){try{localStorage.setItem('cb.'+k,v)}catch(e){}}};
@@ -1653,7 +1972,7 @@ function addMsg(m){
   else{const c=m.kind!=='human';el.className='msg'+(m.kind==='human'&&m.name===ME?' mine':'');
     const ini=m.kind==='claude'?'✳':m.kind==='codex'?'◇':(m.name[0]||'?').toUpperCase();
     el.innerHTML=`<div class="av ${c?'claude':''}" style="background:${c?color(m.name):'var(--human)'}">${esc(ini)}</div>
-    <div class="body"><div class="meta"><b>${esc(m.name)}</b><span class="tag">${c?(PRODUCT[m.kind]||'AI'):'人間'}</span><span>${hhmm(m.ts)}</span><span>#${m.seq}</span></div>
+    <div class="body"><div class="meta"><b>${esc(m.name)}</b><span class="tag">${c?(PRODUCT[m.kind]||'AI'):'人間'}</span><span>${hhmm(m.ts)}</span><span>#${esc(String(m.seq))}</span></div>
     <div class="bubble">${render(m.text)}</div></div>`}
   $('#list').appendChild(el);
   if(stick||m.name===ME)toBottom();else $('#newbtn').style.display='block';
@@ -1674,16 +1993,19 @@ function setState(s){
   const stick=nearBottom();let tail='';
   for(const a of s.agents)if(a.online&&(a.status==='thinking'||a.status==='checking')&&!a.muted&&!s.paused)tail+=`<div class="typing"><span>${esc(a.name)} が${a.status==='checking'?'秘密が漏れていないか確かめています':'考えています'}</span> <button class="mini" data-stop="${esc(a.name)}">この返答を止める</button></div>`;
   for(const a of s.agents)if(a.online&&a.status==='awaiting')tail+=`<div class="typing"><span>${esc(a.name)} の発言を ${esc(a.owner)} さんが確認しています</span></div>`;
-  if(s.paused)tail+=`<div class="banner">■ 止めています。どの AI も返答しません（人間どうしの発言はできます）。<button class="btn" onclick="control({paused:false})">▶ 再開</button></div>`;
-  else if(s.max_turns&&s.auto_turns>=s.max_turns&&s.agents.length)tail+=`<div class="banner">AI どうしのやり取りが、設定した上限（${s.max_turns} 回）に達しました。人間が発言すると再開します。<button class="btn" onclick="control({add_turns:5})">あと 5 回続ける</button><button class="btn" onclick="control({max_turns:0})">上限をなくす</button></div>`;
+  if(s.paused)tail+=`<div class="banner">■ 止めています。どの AI も返答しません（人間どうしの発言はできます）。<button class="btn" data-act="resume">▶ 再開</button></div>`;
+  else if(s.max_turns&&s.auto_turns>=s.max_turns&&s.agents.length)tail+=`<div class="banner">AI どうしのやり取りが、設定した上限（${s.max_turns} 回）に達しました。人間が発言すると再開します。<button class="btn" data-act="add5">あと 5 回続ける</button><button class="btn" data-act="nolimit">上限をなくす</button></div>`;
   $('#tail').innerHTML=tail;if(stick)toBottom();
   document.querySelectorAll('[data-stop]').forEach(b=>b.onclick=()=>muteAgent(b.dataset.stop,true));
 }
 async function api(path,body){const r=await fetch(path,{method:body?'POST':'GET',headers:{'Authorization':'Bearer '+KEY,'Content-Type':'application/json'},body:body?JSON.stringify(body):undefined});
-  if(r.status===401)throw new Error('401');return r.json()}
-function control(o){api('/api/control',Object.assign({by:ME},o)).then(setState).catch(()=>{})}
+  if(r.status===401)throw new Error('401');let j={};try{j=await r.json()}catch(e){}
+  if(!r.ok&&!j.error)j.error=`エラー（${r.status}）`;return j}
+function control(o){api('/api/control',Object.assign({by:ME},o)).then(r=>{if(r.error)alert(r.error);else setState(r)}).catch(()=>{})}
 async function send(){const t=$('#text'),text=t.value.trim();if(!text)return;if(!ME)return askName();
-  $('#send').disabled=true;try{const m=await api('/api/send',{name:ME,kind:'human',text});t.value='';grow();addMsg(m)}catch(e){alert('送信できませんでした')}finally{$('#send').disabled=false;t.focus()}}
+  $('#send').disabled=true;try{const m=await api('/api/send',{name:ME,kind:'human',text,cid:Math.random().toString(36).slice(2)});
+    if(m.error){alert('送信できませんでした: '+m.error);return}t.value='';grow();addMsg(m)}
+  catch(e){alert('送信できませんでした（通信エラー）。入力した文はそのまま残しています')}finally{$('#send').disabled=false;t.focus()}}
 function grow(){const t=$('#text');t.style.height='auto';t.style.height=Math.min(t.scrollHeight,200)+'px'}
 function askName(){$('#nameIn').value=ME;$('#dlgName').showModal()}
 $('#dlgName').addEventListener('close',()=>{const v=$('#nameIn').value.trim();if(!v)return;
@@ -1799,7 +2121,7 @@ textarea{width:100%;min-height:90px;border:1px solid var(--line);border-radius:8
     <details style="margin-top:8px"><summary>設定ファイルの全文</summary><pre class="policy" id="policy"></pre></details></div>
   <div id="turns"></div>
 </div>
-<script>
+<script nonce="__NONCE__">
 const $=s=>document.querySelector(s);
 const TOKEN=new URLSearchParams(location.hash.slice(1)).get('t')||'';
 let v=-1,drafts={};
@@ -1808,8 +2130,8 @@ function marked(text,quotes){let h=esc(text);for(const q of quotes||[]){if(!q)co
 const STATUS={drafting:'下書き中',checking:'チェック中',pending:'あなたの判断待ち',posted:'投稿した',discarded:'捨てた',cancelled:'止められた',error:'エラー',pass:'発言なし'};
 const ACTION={send:'この文で送る',rewrite:'書き直させる',discard:'捨てる'};
 function turnHtml(t){
-  let h=`<div class="card turn ${t.status}" id="turn-${t.id}"><div class="thead"><b>ターン ${t.id}</b><span class="badge b-${t.status}">${STATUS[t.status]||t.status}</span></div>`;
-  for(const m of t.incoming)h+=`<div class="inc"><b>${esc(m.name)}</b> #${m.seq}: ${esc(m.text)}</div>`;
+  let h=`<div class="card turn ${t.status}" id="turn-${t.id}"><div class="thead"><b>ターン ${Number(t.id)}</b><span class="badge b-${esc(t.status)}">${esc(STATUS[t.status]||t.status)}</span></div>`;
+  for(const m of t.incoming)h+=`<div class="inc"><b>${esc(m.name)}</b> #${esc(String(m.seq))}: ${esc(m.text)}</div>`;
   const st=t.steps;
   st.forEach((s,i)=>{
     if(s.kind==='draft'){const next=st[i+1];const q=next&&next.kind==='check'?next.quotes:[];
@@ -1823,7 +2145,7 @@ function turnHtml(t){
   if(t.pending){const d=drafts[t.id]!==undefined?drafts[t.id]:t.pending.draft;
     h+=`<div class="decide"><div class="lbl">送る文（直してから送れます）</div><textarea data-t="${t.id}" class="ta">${esc(d)}</textarea>
     <div class="lbl" style="margin-top:8px">書き直させるときの指示（空でも可）</div><textarea data-n="${t.id}" class="note" style="min-height:44px" placeholder="例: 金額には触れずに、日程の話に戻して"></textarea>
-    <div class="btns"><button class="btn send" onclick="decide(${t.id},'send')">この文で送る</button><button class="btn rw" onclick="decide(${t.id},'rewrite')">書き直させる</button><button class="btn del" onclick="decide(${t.id},'discard')">捨てる</button></div></div>`}
+    <div class="btns"><button class="btn send" data-turn="${t.id}" data-do="send">この文で送る</button><button class="btn rw" data-turn="${t.id}" data-do="rewrite">書き直させる</button><button class="btn del" data-turn="${t.id}" data-do="discard">捨てる</button></div></div>`}
   return h+'</div>'}
 function render(s){
   $('#who').textContent=`${s.me}（${s.owner} さんの代理人）`;
@@ -1838,6 +2160,7 @@ function render(s){
   document.querySelectorAll('textarea.ta').forEach(el=>el.oninput=()=>drafts[el.dataset.t]=el.value);
   if(focused){const el=focused.t?document.querySelector(`textarea[data-t="${focused.t}"]`):focused.n?document.querySelector(`textarea[data-n="${focused.n}"]`):null;if(el)el.focus()}
 }
+document.addEventListener('click',e=>{const b=e.target.closest('[data-do]');if(b)decide(Number(b.dataset.turn),b.dataset.do)});
 async function decide(id,action){
   const text=action==='send'?document.querySelector(`textarea[data-t="${id}"]`).value:action==='rewrite'?document.querySelector(`textarea[data-n="${id}"]`).value:'';
   await fetch('/api/decide',{method:'POST',headers:{'X-Token':TOKEN,'Content-Type':'application/json'},body:JSON.stringify({turn:id,action,text})});delete drafts[id]}

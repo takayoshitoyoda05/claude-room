@@ -4,7 +4,7 @@ build-backend = "setuptools.build_meta"
 
 [project]
 name = "claude-room"
-version = "0.1.0"
+version = "0.2.0"
 description = "自分の Claude と相手の Claude を 1 つの部屋で会話させる（GUI つき・秘密チェックつきの代理人モード）"
 readme = "README.md"
 requires-python = ">=3.8"
