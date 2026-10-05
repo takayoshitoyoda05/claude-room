@@ -1,0 +1,9 @@
+__pycache__/
+*.pyc
+build/
+dist/
+*.egg-info/
+.venv/
+# 部屋のログ・鍵・代理人の記録（ふつうは ~/.claude-room にできるが、念のため）
+*.jsonl
+key

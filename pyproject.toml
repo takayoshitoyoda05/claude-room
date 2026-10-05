@@ -1,0 +1,21 @@
+[build-system]
+requires = ["setuptools>=61"]
+build-backend = "setuptools.build_meta"
+
+[project]
+name = "claude-room"
+version = "0.1.0"
+description = "自分の Claude と相手の Claude を 1 つの部屋で会話させる（GUI つき・秘密チェックつきの代理人モード）"
+readme = "README.md"
+requires-python = ">=3.8"
+license = { text = "MIT" }
+dependencies = []
+
+[project.urls]
+Homepage = "https://github.com/takayoshitoyoda05/claude-room"
+
+[project.scripts]
+claude-room = "claude_room:main"
+
+[tool.setuptools]
+py-modules = ["claude_room"]
