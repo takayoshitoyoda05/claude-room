@@ -461,6 +461,29 @@ class ServerTests(unittest.TestCase):
         s.close()
         self.assertEqual(seqs, list(range(1, n + 2)))
 
+    def test_slow_download_is_not_cut_by_request_deadline(self):
+        # 要求を送り終えるまでの制限時間は、応答を受け取る時間には当てはめない（遅い回線でも読み切れる）
+        for i in range(120):
+            self.room.post("alice", "human", f"{i:03d}" + "x" * 15000)
+        old = cr.HEADER_DEADLINE
+        cr.HEADER_DEADLINE = 1
+        try:
+            s = socket.create_connection(("127.0.0.1", self.srv.server_address[1]), timeout=30)
+            s.setsockopt(socket.SOL_SOCKET, socket.SO_RCVBUF, 65536)
+            s.sendall(f"GET /api/messages?tail=1 HTTP/1.1\r\nHost: x\r\nAuthorization: Bearer {self.key}\r\n\r\n".encode())
+            time.sleep(5)                                         # 制限時間を過ぎるまで、読まずに待つ
+            buf = b""
+            while True:
+                chunk = s.recv(1 << 16)
+                if not chunk:
+                    break
+                buf += chunk
+            s.close()
+        finally:
+            cr.HEADER_DEADLINE = old
+        body = json.loads(buf.split(b"\r\n\r\n", 1)[1])
+        self.assertEqual(len(body["messages"]), 120)
+
     def test_control_rejects_bad_agent_and_log_failure(self):
         code = call(self.base, "/api/control", self.bob, {"by": "bob", "paused": True, "agent": [], "muted": True})[0]
         self.assertEqual(code, 400)
@@ -891,6 +914,29 @@ class FileTests(unittest.TestCase):
             self.assertEqual(path.stat().st_mode & 0o077, 0)
 
 
+class SessionCleanupTests(unittest.TestCase):
+    def test_forget_sessions(self):
+        base = Path(tempfile.mkdtemp(dir=_TMP))
+        proj = base / "projects" / "-some-workdir"
+        proj.mkdir(parents=True)
+        mine, other = "0a1b2c3d-1111-2222-3333-444455556666", "ffffffff-1111-2222-3333-444455556666"
+        (proj / f"{mine}.jsonl").write_text("秘密の設定", encoding="utf-8")
+        (proj / mine).mkdir()
+        (proj / f"{other}.jsonl").write_text("ほかの会話", encoding="utf-8")
+        ag = object.__new__(cr.Agent)
+        ag._sessions = {mine, "../../evil*"}                       # 形のおかしい ID は無視する
+        old = os.environ.get("CLAUDE_CONFIG_DIR")
+        os.environ["CLAUDE_CONFIG_DIR"] = str(base)
+        try:
+            ag.forget_sessions()
+        finally:
+            if old is None:
+                os.environ.pop("CLAUDE_CONFIG_DIR", None)
+            else:
+                os.environ["CLAUDE_CONFIG_DIR"] = old
+        self.assertEqual([p.name for p in proj.iterdir()], [f"{other}.jsonl"])   # 自分の会話だけが消える
+
+
 class ProcessTests(unittest.TestCase):
     def _agent(self):
         ag = object.__new__(cr.Agent)
@@ -923,7 +969,6 @@ class ProcessTests(unittest.TestCase):
         with self.assertRaises(RuntimeError):
             self._run(ag)
 
-    @unittest.skipUnless(POSIX, "プロセスグループは POSIX")
     def test_grandchild_is_killed(self):
         pidfile = Path(tempfile.mkdtemp(dir=_TMP)) / "pid"
         code = ("import subprocess, sys, time; "
@@ -935,11 +980,18 @@ class ProcessTests(unittest.TestCase):
         with self.assertRaises(cr.Stopped):
             ag._run_process([sys.executable, "-c", code], "")
         pid = int(pidfile.read_text())
-        deadline = time.time() + 5
+        deadline = time.time() + 8
         while time.time() < deadline:
-            # ps は Linux でも Mac でも使える。出力が空か Z（ゾンビ）なら、止まっている
-            st = subprocess.run(["ps", "-o", "stat=", "-p", str(pid)], capture_output=True, text=True).stdout.strip()
-            if not st or st.startswith("Z"):
+            if POSIX:
+                # ps は Linux でも Mac でも使える。出力が空か Z（ゾンビ）なら、止まっている
+                st = subprocess.run(["ps", "-o", "stat=", "-p", str(pid)], capture_output=True,
+                                    text=True).stdout.strip()
+                gone = not st or st.startswith("Z")
+            else:
+                st = subprocess.run(["tasklist", "/FI", f"PID eq {pid}", "/NH"], capture_output=True,
+                                    text=True, errors="replace").stdout
+                gone = str(pid) not in st
+            if gone:
                 break
             time.sleep(0.1)
         else:
@@ -968,11 +1020,13 @@ class CodexTests(unittest.TestCase):
         with self.assertRaises(RuntimeError):
             cr.parse_codex_events(self.ev(start, msg, done), code=1)
 
-    @unittest.skipUnless(POSIX, "偽の codex コマンドはシェルスクリプト")
     def test_codex_home_is_per_instance(self):
         d = Path(tempfile.mkdtemp(dir=_TMP))
-        (d / "codex").write_text("#!/bin/sh\necho 'shell_tool stable true'\necho 'unified_exec stable true'\n")
-        (d / "codex").chmod(0o755)
+        if POSIX:
+            (d / "codex").write_text("#!/bin/sh\necho 'shell_tool stable true'\necho 'unified_exec stable true'\n")
+            (d / "codex").chmod(0o755)
+        else:
+            (d / "codex.cmd").write_text("@echo off\r\necho shell_tool stable true\r\necho unified_exec stable true\r\n")
         home = d / "dot-codex"
         home.mkdir()
         (home / "auth.json").write_text("{}")

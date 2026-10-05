@@ -129,7 +129,10 @@ class Denied(Exception):
         self.code = code
 
 if hasattr(sys.stdout, "reconfigure"):
-    sys.stdout.reconfigure(errors="replace")
+    if sys.stdout.isatty():
+        sys.stdout.reconfigure(errors="replace")
+    else:      # ファイルやパイプに出すときは UTF-8（Windows の既定の文字コードでは、日本語を書けない）
+        sys.stdout.reconfigure(encoding="utf-8", errors="replace")
 
 
 def log(*a):
@@ -431,6 +434,16 @@ class HardenedServer(ThreadingHTTPServer):
                 self._active -= 1
                 self._pending.pop(request, None)
 
+    def request_received(self, request):
+        """要求を受け取り終えたら、「送り終えるまでの制限時間」の対象から外す。
+
+        制限時間は、わざと遅く送ってくる相手への備え。応答を送る時間まで含めると、遅い回線の人が
+        大きな応答（参加直後の読み込みなど）を受け取りきれずに切られてしまう。送るほうは、
+        1 回の書き込み（64 KB）ごとの時間切れ（SOCKET_TIMEOUT）で守る。
+        """
+        with self._lock:
+            self._pending.pop(request, None)
+
     def handle_error(self, request, client_address):
         # 相手が切った・こちらが切った接続のエラーは、ターミナルに出さない
         if isinstance(sys.exc_info()[1], (OSError, ValueError)):
@@ -694,6 +707,7 @@ def make_handler(room, key, invites, trust_forwarded=False):
             return parse_json(self.rfile.read(n) or b"{}")
 
         def do_GET(self):
+            self.server.request_received(self.connection)      # GET は、ヘッダーを読んだ時点で受け取り終わり
             try:
                 self._get()
             except ValueError:
@@ -831,6 +845,7 @@ def make_handler(room, key, invites, trust_forwarded=False):
                 d = self._body()
             except ValueError:
                 return self._json(400, {"error": "bad body"})
+            self.server.request_received(self.connection)      # POST は、本文まで読んだら受け取り終わり
             if not isinstance(d, dict):
                 return self._json(400, {"error": "bad body"})
             if not self._still_valid():      # 本文を受け取る間に取り消されていないか
@@ -1252,6 +1267,7 @@ class Panel:
                 return secrets.compare_digest(self.headers.get("X-Token", "").encode(), panel.token.encode())
 
             def do_GET(self):
+                self.server.request_received(self.connection)
                 if not self._host_ok():
                     return self._json(403, {"error": "bad host"})
                 u = urlparse(self.path)
@@ -1359,6 +1375,8 @@ class Agent:
         rec_dir = _ensure_dir(DATA_DIR / "records" / self.me)
         self.record_path = rec_dir / f"{time.strftime('%Y%m%d-%H%M%S')}-{secrets.token_hex(3)}.jsonl"
         self._record_warned = False
+        self._sessions = set()
+        atexit.register(self.forget_sessions)
         self._fails = {}
         self._replies = 0
         self._q = f"&name={quote(self.me)}&owner={quote(self.owner)}&agent={self.product}"
@@ -1537,6 +1555,26 @@ class Agent:
                     time.sleep(3)
         finally:
             self.panel.close()
+
+    def forget_sessions(self):
+        """Claude Code が保存した、この参加での会話のファイルを消す。
+
+        Claude Code は会話を ~/.claude/projects/ に保存する（続きから話すために必要）。そこには、
+        持ち主の非公開の設定を含む指示も入るので、部屋を抜けるときに消す。
+        """
+        base = Path(os.environ.get("CLAUDE_CONFIG_DIR") or Path.home() / ".claude") / "projects"
+        for sid in list(self._sessions):
+            if not re.fullmatch(r"[0-9a-fA-F-]{8,64}", str(sid)):
+                continue
+            try:
+                for f in base.glob(f"*/{sid}*"):
+                    if f.is_dir():
+                        shutil.rmtree(str(f), ignore_errors=True)
+                    else:
+                        f.unlink()
+            except OSError:
+                pass
+        self._sessions.clear()
 
     def _last_seq(self):
         return self.history[-1]["seq"] if self.history else 0
@@ -1829,6 +1867,8 @@ class Agent:
         if self.policy_text:
             system += AGENT_PROMPT.format(owner=self.owner, policy=self.policy_text)
         text, self.session = self._run_ai(prompt, system, model=self.args.model, resume=self.session)
+        if self.product == "claude" and self.session:
+            self._sessions.add(self.session)
         return re.sub(rf"^{re.escape(self.me)}\s*[:：]\s*", "", text)
 
     def _run_ai(self, prompt, system, model=None, resume=None, checker=False):
