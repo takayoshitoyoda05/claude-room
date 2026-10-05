@@ -90,7 +90,7 @@ class InviteTests(unittest.TestCase):
     def test_create_find_revoke(self):
         item, key = self.inv.create("bob")
         self.assertEqual(self.inv.find(key)["name"], "bob")
-        self.assertNotIn(key, self.path.read_text())           # 鍵そのものは保存しない
+        self.assertNotIn(key, self.path.read_text(encoding="utf-8"))           # 鍵そのものは保存しない
         self.assertIsNotNone(self.inv.revoke("bob"))
         self.assertIsNone(self.inv.find(key))
 
@@ -503,7 +503,7 @@ class StorageTests(unittest.TestCase):
 
     def test_legacy_files_are_not_migrated(self):
         legacy = cr.DATA_DIR / "legacyroom.old.jsonl"
-        legacy.write_text('{"seq": 1, "ts": 0, "name": "x", "kind": "human", "text": "別の部屋の秘密"}\n')
+        legacy.write_text('{"seq": 1, "ts": 0, "name": "x", "kind": "human", "text": "別の部屋の秘密"}\n', encoding="utf-8")
         d, log_path, _ = cr.room_paths("legacyroom.old")
         self.assertFalse(log_path.exists())                       # 古い場所のファイルを、勝手に取り込まない
         self.assertTrue(legacy.exists())
@@ -520,7 +520,7 @@ class StorageTests(unittest.TestCase):
             again = cr.Room("r", d / "log.jsonl", 0)
             on_disk = []
             for p in (cr.old_path(d / "log.jsonl"), d / "log.jsonl"):
-                on_disk += [json.loads(l)["text"] for l in p.read_text().splitlines()]
+                on_disk += [json.loads(l)["text"] for l in p.read_text(encoding="utf-8").splitlines()]
             self.assertEqual([m["text"] for m in again.messages], on_disk)   # 残っているログを全部、順番どおりに
             self.assertEqual(on_disk[-1], "m19")
         finally:
@@ -1064,7 +1064,7 @@ class PanelRenderTests(unittest.TestCase):
                           {"kind": "human", "action": evil, "text": evil}],
                 "pending": {"draft": evil, "verdict": None}, "error": evil}
         code = stub + js + f"\nprocess.stdout.write(turnHtml({json.dumps(turn)}));"
-        out = subprocess.run(["node", "-e", code], capture_output=True, text=True, timeout=30)
+        out = subprocess.run(["node", "-e", code], capture_output=True, text=True, encoding="utf-8", timeout=30)
         self.assertEqual(out.returncode, 0, out.stderr)
         self.assertNotIn("<svg", out.stdout)
         self.assertIn("&lt;svg", out.stdout)

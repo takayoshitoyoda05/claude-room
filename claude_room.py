@@ -943,7 +943,8 @@ def tailscale_ip():
     if not exe:
         return None
     try:
-        out = subprocess.run([exe, "ip", "-4"], capture_output=True, text=True, timeout=5).stdout.split()
+        out = subprocess.run([exe, "ip", "-4"], capture_output=True, text=True, encoding="utf-8",
+                             errors="replace", timeout=5).stdout.split()
     except (OSError, subprocess.SubprocessError):
         return None
     return out[0] if out else None
@@ -960,6 +961,7 @@ def start_funnel(port, https_port):
         sys.exit("tailscale コマンドが見つかりません（--public には、ホストの PC の Tailscale が必要です）")
     try:
         dns = json.loads(subprocess.run([exe, "status", "--json"], capture_output=True, text=True,
+                                        encoding="utf-8", errors="replace",
                                         timeout=10).stdout)["Self"]["DNSName"].rstrip(".")
     except (OSError, ValueError, KeyError, subprocess.SubprocessError):
         sys.exit("Tailscale の状態を読めません（tailscale status で、つながっているかを確かめてください）")
@@ -1365,7 +1367,7 @@ class Agent:
         # --safe-mode: CLAUDE.md・MCP・フック・プラグインを読み込まない（読み込むと、その中身が相手に漏れうる）
         try:
             help_text = subprocess.run([self.bin, "--help"], stdin=subprocess.DEVNULL, capture_output=True,
-                                       text=True, timeout=30).stdout
+                                       text=True, encoding="utf-8", errors="replace", timeout=30).stdout
         except (OSError, subprocess.SubprocessError):
             help_text = ""
         # --append-system-prompt-file は、ヘルプには「--append-system-prompt[-file]」と書かれている
@@ -1411,7 +1413,8 @@ class Agent:
         # 切る機能のうち、この版の Codex にあるものだけを指定する（ない名前を渡すと失敗する版があるため）
         try:
             out = subprocess.run([self.bin, "features", "list"], stdin=subprocess.DEVNULL, capture_output=True,
-                                 text=True, timeout=30, env=self.codex_env).stdout
+                                 text=True, encoding="utf-8", errors="replace", timeout=30,
+                                 env=self.codex_env).stdout
         except (OSError, subprocess.SubprocessError):
             out = ""
         known = {line.split()[0] for line in out.splitlines() if line.split() and "removed" not in line}
