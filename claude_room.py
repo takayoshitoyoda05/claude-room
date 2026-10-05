@@ -35,6 +35,8 @@ FLOOR_LEASE = 900          # 発言権の有効期限（秒）。Claude が落�
 ONLINE_SECS = 75           # この秒数ハートビートがなければオフライン扱い
 DEFAULT_TOOLS = "Read,Grep,Glob"
 PASS_TOKEN = "[PASS]"
+NAME_RE = re.compile(r"[\w\-.]{1,40}")
+STATUSES = {"idle", "thinking", "checking", "awaiting"}
 
 if hasattr(sys.stdout, "reconfigure"):
     sys.stdout.reconfigure(errors="replace")
@@ -205,7 +207,9 @@ def make_handler(room, key):
             if u.path == "/api/wait":
                 name, owner = qs.get("name", [""])[0], qs.get("owner", [""])[0]
                 if name:
-                    room.heartbeat(name[:40], owner[:40])
+                    if not (NAME_RE.fullmatch(name) and NAME_RE.fullmatch(owner)):
+                        return self._json(400, {"error": "bad name"})
+                    room.heartbeat(name, owner)
                 v = int(qs.get("v", ["-1"])[0])
                 timeout = min(float(qs.get("timeout", ["25"])[0]), 50)
                 with room.cond:
@@ -252,7 +256,9 @@ def make_handler(room, key):
                 d = self._body()
             except ValueError:
                 return self._json(400, {"error": "bad body"})
-            name = str(d.get("name") or d.get("by") or "").strip()[:40]
+            name = str(d.get("name") or d.get("by") or "").strip()
+            if name and not NAME_RE.fullmatch(name):
+                return self._json(400, {"error": "名前に使えるのは、文字・数字・- _ . の 40 文字までです"})
             if u.path == "/api/send":
                 text = str(d.get("text") or "").strip()
                 kind = d.get("kind") if d.get("kind") in ("human", "claude") else "human"
@@ -289,7 +295,10 @@ def make_handler(room, key):
                 room.release(name)
                 return self._json(200, {"ok": True})
             if u.path == "/api/status":
-                room.set_status(name, str(d.get("status") or "idle")[:20])
+                status = str(d.get("status") or "idle")
+                if status not in STATUSES:
+                    return self._json(400, {"error": "bad status"})
+                room.set_status(name, status)
                 return self._json(200, {"ok": True})
             self._json(404, {"error": "not found"})
 
@@ -1088,16 +1097,17 @@ function setState(s){
   $('#pause').title=s.paused?'Claude を再開する':'両方の Claude を止める（Esc）';
   $('#chips').innerHTML=s.agents.map(a=>{const cls=!a.online?'':a.muted?'':(a.status==='thinking'||a.status==='checking')?'thinking':'on';
     const label=!a.online?'オフライン':a.muted?'停止中':(ST[a.status]||a.status);
-    return `<span class="chip${a.muted?' muted':''}" data-n="${esc(a.name)}" title="クリックで @メンション"><span class="dot ${cls}"></span>${esc(a.name)}<span style="color:var(--mute)">${label}</span><button class="mini" data-m="${esc(a.name)}" data-v="${a.muted?0:1}" title="${a.muted?'この Claude を再開':'この Claude だけ止める'}">${a.muted?'▶':'■'}</button></span>`}).join('')
+    return `<span class="chip${a.muted?' muted':''}" data-n="${esc(a.name)}" title="クリックで @メンション"><span class="dot ${cls}"></span>${esc(a.name)}<span style="color:var(--mute)">${esc(label)}</span><button class="mini" data-m="${esc(a.name)}" data-v="${a.muted?0:1}" title="${a.muted?'この Claude を再開':'この Claude だけ止める'}">${a.muted?'▶':'■'}</button></span>`}).join('')
     +`<span class="chip" title="ブラウザで見ている人数">閲覧 ${s.viewers}</span>`;
   document.querySelectorAll('.chip[data-n]').forEach(c=>c.onclick=()=>{const t=$('#text');t.value+=`@${c.dataset.n} `;t.focus()});
   document.querySelectorAll('.mini[data-m]').forEach(b=>b.onclick=e=>{e.stopPropagation();muteAgent(b.dataset.m,b.dataset.v==='1')});
   const stick=nearBottom();let tail='';
-  for(const a of s.agents)if(a.online&&(a.status==='thinking'||a.status==='checking')&&!a.muted&&!s.paused)tail+=`<div class="typing"><span>${esc(a.name)} が${a.status==='checking'?'秘密が漏れていないか確かめています':'考えています'}</span> <button class="mini" onclick="muteAgent('${esc(a.name)}',true)">この返答を止める</button></div>`;
+  for(const a of s.agents)if(a.online&&(a.status==='thinking'||a.status==='checking')&&!a.muted&&!s.paused)tail+=`<div class="typing"><span>${esc(a.name)} が${a.status==='checking'?'秘密が漏れていないか確かめています':'考えています'}</span> <button class="mini" data-stop="${esc(a.name)}">この返答を止める</button></div>`;
   for(const a of s.agents)if(a.online&&a.status==='awaiting')tail+=`<div class="typing"><span>${esc(a.name)} の発言を ${esc(a.owner)} さんが確認しています</span></div>`;
   if(s.paused)tail+=`<div class="banner">■ 止めています。どちらの Claude も返答しません（人間どうしの発言はできます）。<button class="btn" onclick="control({paused:false})">▶ 再開</button></div>`;
   else if(s.max_turns&&s.auto_turns>=s.max_turns&&s.agents.length)tail+=`<div class="banner">Claude どうしのやり取りが、設定した上限（${s.max_turns} 回）に達しました。人間が発言すると再開します。<button class="btn" onclick="control({add_turns:5})">あと 5 回続ける</button><button class="btn" onclick="control({max_turns:0})">上限をなくす</button></div>`;
   $('#tail').innerHTML=tail;if(stick)toBottom();
+  document.querySelectorAll('[data-stop]').forEach(b=>b.onclick=()=>muteAgent(b.dataset.stop,true));
 }
 async function api(path,body){const r=await fetch(path,{method:body?'POST':'GET',headers:{'Authorization':'Bearer '+KEY,'Content-Type':'application/json'},body:body?JSON.stringify(body):undefined});
   if(r.status===401)throw new Error('401');return r.json()}
@@ -1106,7 +1116,9 @@ async function send(){const t=$('#text'),text=t.value.trim();if(!text)return;if(
   $('#send').disabled=true;try{const m=await api('/api/send',{name:ME,kind:'human',text});t.value='';grow();addMsg(m)}catch(e){alert('送信できませんでした')}finally{$('#send').disabled=false;t.focus()}}
 function grow(){const t=$('#text');t.style.height='auto';t.style.height=Math.min(t.scrollHeight,200)+'px'}
 function askName(){$('#nameIn').value=ME;$('#dlgName').showModal()}
-$('#dlgName').addEventListener('close',()=>{const v=$('#nameIn').value.trim();if(v){ME=v;store.set('name',v);$('#me').textContent=v}});
+$('#dlgName').addEventListener('close',()=>{const v=$('#nameIn').value.trim();if(!v)return;
+  if(!/^[\p{L}\p{N}_\-.]{1,40}$/u.test(v)){alert('名前に使えるのは、文字・数字・- _ . の 40 文字までです（空白は使えません）');return askName()}
+  ME=v;store.set('name',v);$('#me').textContent=v});
 $('#dlgKey').addEventListener('close',()=>{const v=$('#keyIn').value.trim().replace(/^.*#key=/,'');if(v){KEY=v;store.set('key',v);start()}});
 $('#rename').onclick=askName;$('#send').onclick=send;$('#newbtn').onclick=toBottom;
 $('#text').addEventListener('input',grow);
