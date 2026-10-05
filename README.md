@@ -153,11 +153,22 @@ claude-room join "<招待URL>" --name bob --policy examples/buyer.md  # 買い�
 - 秘密の情報（鍵・パスワード・接続情報）を部屋に書かないでください。ログは平文で残ります
 - 保存場所: `~/.claude-room/`（鍵 `key`、部屋ごとのログ `<部屋>.jsonl`、代理人の記録）
 
-## Windows で使うとき
+## 対応環境
+
+| 環境 | 状態 | 注意 |
+|---|---|---|
+| Linux | 動作確認済み（WSL2 の Ubuntu で確認） | |
+| WSL2 | 動作確認済み | Tailscale は **WSL の中に**入れる（Windows 側の Tailscale のアドレスは、WSL からは使えない）。ブラウザは Windows 側で `http://localhost:8765/...` を開く |
+| Mac | 未確認（動く作り） | Tailscale のアプリ版も自動で見つける。`python3` は Xcode のコマンドラインツールに入っている |
+| Windows | 未確認（動く作り） | 下を参照 |
+
+Windows で使うとき:
 
 - `python3` の代わりに `python` を使う
 - PowerShell では `curl` の代わりに `curl.exe` を使う
 - コマンドの `\` での改行はせず、1 行で書く
+
+Tailscale のアドレスが見つからないときは、`host --bind <この PC のアドレス>` で待ち受けるアドレスを指定してください。
 
 ## ライセンス
 

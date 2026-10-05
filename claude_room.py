@@ -321,15 +321,23 @@ def serve(room, key, binds, port):
     return servers
 
 
+TAILSCALE_PATHS = [
+    "/Applications/Tailscale.app/Contents/MacOS/Tailscale",   # Mac のアプリ版は PATH に入らない
+    r"C:\Program Files\Tailscale\tailscale.exe",
+]
+
+
 def tailscale_ip():
-    exe = shutil.which("tailscale")
-    if not exe:
-        return None
-    try:
-        out = subprocess.run([exe, "ip", "-4"], capture_output=True, text=True, timeout=5).stdout
-        return out.split()[0] if out.split() else None
-    except (OSError, subprocess.SubprocessError):
-        return None
+    for exe in [shutil.which("tailscale")] + TAILSCALE_PATHS:
+        if not exe or not os.path.exists(exe):
+            continue
+        try:
+            out = subprocess.run([exe, "ip", "-4"], capture_output=True, text=True, timeout=5).stdout.split()
+        except (OSError, subprocess.SubprocessError):
+            continue
+        if out:
+            return out[0]
+    return None
 
 
 def load_key(rotate):
@@ -919,6 +927,7 @@ def cmd_host(a):
               f'python3 claude_room.py join "{b}/#key={key}" --name <相手の名前>')
     if not public:
         print("  [注意] Tailscale のアドレスが見つからないため、この PC の中からしか開けません")
+        print("         相手を入れるには、--bind <この PC のアドレス> で待ち受けるアドレスを指定してください")
     print("  ※ 招待URLは鍵そのもの。信頼できる相手にだけ、1 対 1 で渡してください")
     print()
 
