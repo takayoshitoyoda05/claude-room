@@ -15,6 +15,7 @@ import collections
 import getpass
 import hashlib
 import hmac
+import ipaddress
 import json
 import os
 import re
@@ -417,7 +418,7 @@ class HardenedServer(ThreadingHTTPServer):
                 self.shutdown_request(request)
                 return
             self._active += 1
-            self._pending[request] = time.time()
+            self._pending[request] = time.monotonic()      # 時計の変更に影響されない時刻で測る
         try:
             super().process_request(request, client_address)
         except Exception:
@@ -457,7 +458,7 @@ class HardenedServer(ThreadingHTTPServer):
     def _reaper(self):
         while not getattr(self, "_closed", False):
             time.sleep(2)
-            now = time.time()
+            now = time.monotonic()
             with self._lock:
                 late = [r for r, t in self._pending.items() if now - t > HEADER_DEADLINE]
                 for r in late:
@@ -681,9 +682,14 @@ def make_handler(room, key, invites, trust_forwarded=False):
             """
             peer = self.client_address[0]
             if trust_forwarded and peer == "127.0.0.1":
-                fwd = (self.headers.get("X-Forwarded-For") or "").split(",")[0].strip()
-                if fwd and len(fwd) <= 64:
-                    return fwd
+                # tailscaled は、このヘッダーを 1 つの IP アドレスで上書きする。それ以外の形（複数の値、
+                # 重複したヘッダー、IP でない文字列）は中継が付けたものではないので、使わない
+                values = self.headers.get_all("X-Forwarded-For") or []
+                if len(values) == 1:
+                    try:
+                        return str(ipaddress.ip_address(values[0].strip()))
+                    except ValueError:
+                        pass
             return peer
 
         def _may_act_as(self, name):

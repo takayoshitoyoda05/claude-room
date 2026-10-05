@@ -568,6 +568,14 @@ class PublicModeTests(unittest.TestCase):
         self.assertEqual(codes[-1], 429)                       # 攻撃している送信元は締め出される
         self.assertEqual(bad("198.51.100.7"), 401)             # 別の送信元は巻き込まれない
 
+    def test_malformed_forwarded_header_is_not_trusted(self):
+        base = self._server(True)
+        # IP でない値・複数の値は、中継が付けたものではないので使わない（接続元の 127.0.0.1 として数える）
+        vals = ["not-an-ip", "1.2.3.4, 5.6.7.8", "<script>", "999.1.1.1"]
+        codes = [call(base, "/api/messages", "wrong", headers={"X-Forwarded-For": vals[i % 4] + ("" if i % 4 else str(i))})[0]
+                 for i in range(cr.FAIL_LIMIT + 2)]
+        self.assertEqual(codes[-1], 429)                       # 値を変え続けても、締め出しを逃れられない
+
     def test_forwarded_header_ignored_when_not_public(self):
         base = self._server(False)
         codes = [call(base, "/api/messages", "wrong", headers={"X-Forwarded-For": f"10.0.0.{i}"})[0]
