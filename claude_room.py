@@ -803,7 +803,8 @@ class Agent:
         Path(args.workdir).mkdir(parents=True, exist_ok=True)
         # --safe-mode: CLAUDE.md・MCP・フック・プラグインを読み込まない（読み込むと、その中身が相手に漏れうる）
         try:
-            help_text = subprocess.run([self.claude, "--help"], capture_output=True, text=True, timeout=30).stdout
+            help_text = subprocess.run([self.claude, "--help"], stdin=subprocess.DEVNULL, capture_output=True,
+                                       text=True, timeout=30).stdout
         except (OSError, subprocess.SubprocessError):
             help_text = ""
         self.safe_mode = "--safe-mode" in help_text
@@ -1170,7 +1171,7 @@ def cmd_join(a):
     if not key:
         sys.exit("URL に #key=... が含まれていません（招待URLをそのまま貼ってください）")
     base = f"{u.scheme}://{u.netloc}"
-    print(f"\n  ブラウザで会話を見る:  {base}/#key={key}\n")
+    print(f"\n  ブラウザで会話を見る:  {base}/#key={key}\n", flush=True)
     Agent(base, key, a.name, a).run()
 
 
