@@ -503,10 +503,24 @@ class ServerTests(unittest.TestCase):
         self.assertEqual(code, 507)
         self.assertEqual(call(self.base, "/api/messages", self.bob)[0], 200)   # 取り消しは反映されていない
 
-    def test_ping_proof(self):
-        code, r = call(self.base, "/api/ping?challenge=abc")
-        import hmac as _h
-        self.assertEqual(r["proof"], _h.new(self.room.instance.encode(), b"abc", "sha256").hexdigest())
+    def test_signed_admin_requests(self):
+        # invite コマンドは鍵を送らず、部屋の秘密で署名する。署名は 1 回限りで、別の秘密では通らない
+        secret = self.room.instance
+        body = json.dumps({"name": "dave"}).encode()
+        ts, nonce = str(int(time.time())), os.urandom(16).hex()
+        sig = cr.admin_signature(secret, "POST", "/api/invites", ts, nonce, body)
+        h = {"X-Admin-Ts": ts, "X-Admin-Nonce": nonce, "X-Admin-Sig": sig}
+        self.assertEqual(call(self.base, "/api/invites", None, {"name": "dave"}, headers=h)[0], 200)
+        self.assertEqual(call(self.base, "/api/invites", None, {"name": "dave"}, headers=h)[0], 401)   # 使い回し
+        bad = dict(h, **{"X-Admin-Nonce": os.urandom(16).hex(),
+                         "X-Admin-Sig": cr.admin_signature("other", "POST", "/api/invites", ts, nonce, body)})
+        self.assertEqual(call(self.base, "/api/invites", None, {"name": "erin"}, headers=bad)[0], 401)
+        old_ts = str(int(time.time()) - 600)
+        n2 = os.urandom(16).hex()
+        stale = {"X-Admin-Ts": old_ts, "X-Admin-Nonce": n2,
+                 "X-Admin-Sig": cr.admin_signature(secret, "POST", "/api/invites", old_ts, n2, body)}
+        self.assertEqual(call(self.base, "/api/invites", None, {"name": "dave"}, headers=stale)[0], 401)   # 古い署名
+        self.assertEqual(call(self.base, "/api/invites", self.bob, {"name": "x"})[0], 403)                 # 招待の鍵では不可
 
     def test_control_is_all_or_nothing(self):
         before = len(self.room.messages)
@@ -938,6 +952,17 @@ class MaliciousHostTests(unittest.TestCase):
                             self.wfile.write(f"X-Slow-{i}: a\r\n".encode())
                             self.wfile.flush()
                             time.sleep(0.3)
+                    elif mode == "close":
+                        self.send_response(200)
+                        self.send_header("Connection", "close")
+                        self.send_header("Transfer-Encoding", "chunked")
+                        self.end_headers()
+                        self.wfile.write(b"2\r\n{}\r\n0\r\n")
+                        self.wfile.flush()
+                        for _ in range(100):
+                            self.wfile.write(b"X")
+                            self.wfile.flush()
+                            time.sleep(0.3)
                     elif mode == "401chunked":
                         self.send_response(401)
                         self.send_header("Transfer-Encoding", "chunked")
@@ -977,7 +1002,7 @@ class MaliciousHostTests(unittest.TestCase):
         old = cr.READ_GRACE
         cr.READ_GRACE = 1
         try:
-            for mode in ("headers", "401", "chunked", "401chunked"):
+            for mode in ("headers", "401", "chunked", "401chunked", "close"):
                 ag = object.__new__(cr.Agent)
                 ag.base, ag.key = self._drip_server(mode), "k"
                 t = time.time()
@@ -990,6 +1015,13 @@ class MaliciousHostTests(unittest.TestCase):
             self.assertEqual(cr._INFLIGHT[0], 0)
         finally:
             cr.READ_GRACE = old
+
+    def test_utf16_json_is_rejected(self):
+        bomb = json.dumps(['"'] + [[]] * (cr.MAX_JSON_BRACKETS + 1))
+        for enc in ("utf-16-le", "utf-16-be", "utf-32-le"):
+            with self.assertRaises(ValueError):
+                cr.parse_json(bomb.encode(enc))                   # UTF-8 以外は断る（走査の解釈がずれないように）
+        self.assertEqual(cr.parse_json('{"a": "日本語"}'.encode("utf-8"))["a"], "日本語")
 
     def test_bracket_scan_is_linear(self):
         for n in (8000, 32000, 128000):
@@ -1180,7 +1212,7 @@ class FileTests(unittest.TestCase):
         ag = object.__new__(cr.Agent)
         ag.codex_home = Path(tempfile.mkdtemp(dir=_TMP))
         ag.codex_disable = ["shell_tool", "unified_exec"]
-        system = '部屋のルール\n"引用"と \\ と\tタブ'
+        system = '部屋のルール 🔒\n"引用"と \\ と\tタブ'
         path = ag._codex_config(system)
         conf = tomllib.loads(path.read_text(encoding="utf-8"))
         self.assertEqual(conf["developer_instructions"], system)
@@ -1415,6 +1447,31 @@ class PanelRenderTests(unittest.TestCase):
         self.assertEqual(out.returncode, 0, out.stderr)
         self.assertNotIn("<svg", out.stdout)
         self.assertIn("&lt;svg", out.stdout)
+
+
+@unittest.skipUnless(shutil.which("node"), "node がない")
+class RoomPageTests(unittest.TestCase):
+    def test_browser_keeps_bounded_history(self):
+        js = re.search(r'<script nonce="__NONCE__">(.*)</script>', cr.PAGE, re.S).group(1)
+        stub = """
+        class El{constructor(){this.children=[];this.style={};this.dataset={};this.classList={toggle(){},add(){}};this.value='';this.scrollTop=0;this.scrollHeight=0;this.clientHeight=0}
+          appendChild(c){this.children.push(c)} removeChild(c){this.children.splice(this.children.indexOf(c),1)}
+          get firstChild(){return this.children[0]} addEventListener(){} querySelectorAll(){return[]} querySelector(){return new El()}
+          set innerHTML(v){} get innerHTML(){return ''} set textContent(v){} showModal(){} close(){} focus(){} }
+        const main=new El(), list=new El(); const els={'#main':main,'#list':list};
+        var document={addEventListener(){},activeElement:null,createElement(){return new El()},
+          querySelector(s){return els[s]||new El()},querySelectorAll(){return[]}};
+        var location={hash:'',pathname:'/',origin:'http://x'}; var history={replaceState(){}};
+        var sessionStorage={getItem(){return null},setItem(){}}; var localStorage={removeItem(){}};
+        var fetch=()=>new Promise(()=>{}); var window={}; var alert=()=>{};
+        """
+        code = stub + js + """
+        for(let i=1;i<=MAX_SHOWN+500;i++) addMsg({seq:i,ts:0,name:'bob',kind:'human',text:'x'});
+        process.stdout.write(JSON.stringify({dom:list.children.length,msgs:msgs.length,seen:seen.size}));"""
+        out = subprocess.run(["node", "-e", code], capture_output=True, text=True, encoding="utf-8", timeout=60)
+        self.assertEqual(out.returncode, 0, out.stderr[-500:])
+        r = json.loads(out.stdout)
+        self.assertEqual((r["dom"], r["msgs"], r["seen"]), (2000, 2000, 2000))   # 画面に残すのは 2000 件まで
 
 
 if __name__ == "__main__":

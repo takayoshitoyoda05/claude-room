@@ -374,6 +374,16 @@ class Room:
             self._bump()
             return self.state()
 
+    def use_nonce(self, nonce):
+        """署名つきの要求の 1 回限りの番号。同じものは二度と受け付けない。"""
+        with self.cond:
+            now = time.time()
+            self._nonces = {k: t for k, t in getattr(self, "_nonces", {}).items() if now - t < 120}
+            if nonce in self._nonces:
+                return False
+            self._nonces[nonce] = now
+            return True
+
     def limit_hit(self):
         return bool(self.max_turns) and self.auto_turns >= self.max_turns
 
@@ -593,6 +603,11 @@ def _security_headers(handler, nonce):
     handler.send_header("Referrer-Policy", "no-referrer")
 
 
+def admin_signature(secret, method, path, ts, nonce, body):
+    msg = "\n".join([method, path, str(ts), nonce, hashlib.sha256(body).hexdigest()]).encode()
+    return hmac.new(secret.encode(), msg, "sha256").hexdigest()
+
+
 def _sha256(text):
     return hashlib.sha256(text.encode()).hexdigest()
 
@@ -709,7 +724,12 @@ def make_handler(room, key, invites, trust_forwarded=False, browser_key=None):
             """
             got = self.headers.get("Authorization", "")
             got = got[7:] if got.startswith("Bearer ") else ""
-            # ホストの鍵（永続。自分の AI と invite コマンドが使う）か、ブラウザ用の鍵（起動のたびに変わる）
+            # invite コマンドは、鍵を送らずに、この部屋だけが知る秘密で要求に署名する（ポートを横取りした
+            # 別のサーバーに要求が届いても、鍵は渡らない。署名は 1 回限りなので、使い回しもできない）
+            if self.headers.get("X-Admin-Sig") and self._admin_signed():
+                self.who = {"role": "host", "name": room.host_name}
+                return self._count()
+            # ホストの鍵（永続。自分の AI が使う）か、ブラウザ用の鍵（起動のたびに変わる）
             if got and (secrets.compare_digest(got.encode(), key.encode()) or (
                     browser_key and secrets.compare_digest(got.encode(), browser_key.encode()))):
                 self.who = {"role": "host", "name": room.host_name}
@@ -725,6 +745,23 @@ def make_handler(room, key, invites, trust_forwarded=False, browser_key=None):
                 self.server.record_fail(ip)
                 self._json(401, {"error": "bad key"})
             return False
+
+        def _admin_signed(self):
+            try:
+                ts, nonce, sig = (self.headers.get(h, "") for h in ("X-Admin-Ts", "X-Admin-Nonce", "X-Admin-Sig"))
+                if abs(time.time() - int(ts)) > 60 or not re.fullmatch(r"[0-9a-f]{32}", nonce):
+                    return False
+                n = int(self.headers.get("Content-Length") or 0)
+                if n < 0 or n > 4 * MAX_TEXT:
+                    return False
+                body = self.rfile.read(n)
+                self._signed_body = body
+                expect = admin_signature(room.instance, self.command, self.path, ts, nonce, body)
+                if not hmac.compare_digest(sig, expect):
+                    return False
+                return room.use_nonce(nonce)
+            except (ValueError, OSError):
+                return False
 
         def _count(self):
             if not self.server.begin_request(self._who_id()):
@@ -772,6 +809,8 @@ def make_handler(room, key, invites, trust_forwarded=False, browser_key=None):
             return None if self.who["role"] == "host" else (lambda: invites.is_active(self.who["id"]))
 
         def _body(self):
+            if hasattr(self, "_signed_body"):      # 署名の確認で、すでに読んである
+                return parse_json(self._signed_body or b"{}")
             n = int(self.headers.get("Content-Length") or 0)
             if n < 0 or n > 4 * MAX_TEXT:
                 raise ValueError("bad length")
@@ -794,11 +833,7 @@ def make_handler(room, key, invites, trust_forwarded=False, browser_key=None):
                 return self._send(200, PAGE.replace("__REPO_URL__", REPO_URL).replace("__NONCE__", nonce).encode(),
                                   "text/html; charset=utf-8", nonce=nonce)
             if u.path == "/api/ping":
-                # 本物の部屋かを確かめるための応答（invite コマンドが、ポートを横取りした別のサーバーに
-                # ホストの鍵を送らないように）。部屋だけが知る秘密で、毎回違う問いに答える
-                ch = qs.get("challenge", [""])[0][:64]
-                proof = hmac.new(room.instance.encode(), ch.encode(), "sha256").hexdigest() if ch else None
-                return self._json(200, {"ok": True, "proof": proof})
+                return self._json(200, {"ok": True})
             if not self._authed():
                 return
             after = int(qs.get("after", ["0"])[0])
@@ -2009,7 +2044,7 @@ class Agent:
         """部屋専用の CODEX_HOME に、この 1 回分の設定を書く。部屋のルールは「開発者の指示」として渡す。"""
         lines = ['sandbox_mode = "read-only"', 'web_search = "disabled"',
                  # 値は TOML の文字列。JSON の文字列の書き方は、TOML の基本文字列としても正しい
-                 "developer_instructions = " + json.dumps(system, ensure_ascii=True), "", "[features]"]
+                 "developer_instructions = " + toml_string(system), "", "[features]"]
         lines += [f"{f} = false" for f in self.codex_disable]
         path = self.codex_home / "config.toml"
         fd = os.open(str(path), os.O_WRONLY | os.O_CREAT | os.O_TRUNC, 0o600)
@@ -2212,6 +2247,25 @@ class _WindowsJob:
             pass
 
 
+def toml_string(text):
+    """TOML の基本文字列を作る。JSON の書き方は絵文字などで TOML と食い違う（\\ud83d のような代理対は TOML では
+    不正）ので、TOML の決まりどおりに、\\ と " と制御文字だけをエスケープし、それ以外はそのまま書く。"""
+    out = []
+    for ch in text:
+        o = ord(ch)
+        if ch == "\\":
+            out.append("\\\\")
+        elif ch == '"':
+            out.append('\\"')
+        elif o < 0x20 or o == 0x7F:
+            out.append({"\n": "\\n", "\t": "\\t", "\r": "\\r"}.get(ch, f"\\u{o:04X}"))
+        elif 0xD800 <= o <= 0xDFFF:                 # 対になっていない代理符号は、TOML に書けない
+            out.append("\\uFFFD")
+        else:
+            out.append(ch)
+    return '"' + "".join(out) + '"'
+
+
 def _cleanup_stale(root):
     """強制終了などで残った、持ち主のプロセスがもういない Codex の設定フォルダを消す。"""
     for d in root.iterdir():
@@ -2354,7 +2408,11 @@ def cmd_host(a):
             binds.append("127.0.0.1")
         up = serve(room, key, invites, binds, a.port, browser_key=browser_key)
         public = [h for h in up if not h.startswith("127.")]
-        room.invite_bases = [f"http://{h}:{a.port}" for h in public]
+        # 0.0.0.0（すべて）で待ち受けたときは、招待には届くアドレス（Tailscale か、指定された個別のアドレス）を使う
+        reach = [h for h in public if h not in ("0.0.0.0", "::")]
+        if any(h in ("0.0.0.0", "::") for h in public):
+            reach += [h for h in (tailscale_ip(),) if h and h not in reach]
+        room.invite_bases = [f"http://{h}:{a.port}" for h in reach]
 
     print()
     print(f"  Claude Room   ルーム「{a.room}」   ホスト: {a.name}")
@@ -2385,7 +2443,7 @@ def cmd_host(a):
         log("自分の AI は参加させずに、部屋だけ開きました（Ctrl+C で終了）")
         while True:
             time.sleep(3600)
-    Agent(f"http://{up[0]}:{a.port}", key, a.name, a).run()
+    Agent(f"http://127.0.0.1:{a.port}", key, a.name, a).run()      # 自分の AI は、同じ PC の中からつなぐ
 
 
 def read_json(resp, limit, deadline=None):
@@ -2410,7 +2468,7 @@ def read_json(resp, limit, deadline=None):
     return parse_json(b"".join(chunks))
 
 
-_JSON_TOKEN_RE = re.compile(rb'\\.|"|[\[{]')      # エスケープ・引用符・開き括弧を、前から順に 1 回ずつ見る
+_JSON_TOKEN_RE = re.compile(r'\\.|"|[\[{]')       # エスケープ・引用符・開き括弧を、前から順に 1 回ずつ見る
 
 
 def count_brackets(data, limit):
@@ -2422,9 +2480,9 @@ def count_brackets(data, limit):
     n, in_str = 0, False
     for m in _JSON_TOKEN_RE.finditer(data):
         c = m.group()[:1]
-        if c == b"\\":
+        if c == "\\":
             continue
-        if c == b'"':
+        if c == '"':
             in_str = not in_str
         elif not in_str:
             n += 1
@@ -2438,6 +2496,13 @@ def parse_json(data, max_objects=MAX_JSON_OBJECTS):
 
     オブジェクトの数を数えるのは、{} を大量に並べた小さな応答で、大量のメモリを使わせる攻撃を防ぐため。
     """
+    # 先に UTF-8 として厳密に読む（json.loads は UTF-16/32 も受け付けるが、括弧を数える走査と解釈が
+    # ずれて上限をすり抜けられるので、UTF-8 以外は断る）
+    if isinstance(data, bytes):
+        try:
+            data = data.decode("utf-8")
+        except UnicodeDecodeError:
+            raise ValueError("JSON は UTF-8 である必要があります")
     # 文字列の中の [ { は数えない（発言の本文に括弧が多いだけで、履歴が読めなくならないように）
     if count_brackets(data, MAX_JSON_BRACKETS) > MAX_JSON_BRACKETS:
         raise ValueError("配列やオブジェクトが多すぎます")
@@ -2460,13 +2525,19 @@ MAX_INFLIGHT = 8                 # 締め切りを過ぎても終わらない通
 _SSL_CONTEXT = ssl.create_default_context()
 
 
-def _shutdown_conn(conn):
-    """接続のソケットを閉じて、別のスレッドで止まっている読み書きを終わらせる。"""
-    try:
-        if conn.sock is not None:
-            conn.sock.shutdown(socket.SHUT_RDWR)
-    except Exception:  # noqa: BLE001
-        pass
+def _shutdown_conn(conn, sock=None):
+    """接続のソケットを閉じて、別のスレッドで止まっている読み書きを終わらせる。
+
+    sock は接続した直後に控えたソケット。Connection: close の応答では http.client が conn.sock を手放す
+    （応答の側に移す）ので、conn.sock だけを見ていると閉じられない。
+    """
+    for target in (sock, getattr(conn, "sock", None)):
+        if target is None:
+            continue
+        try:
+            target.shutdown(socket.SHUT_RDWR)
+        except Exception:  # noqa: BLE001
+            pass
     try:
         conn.close()
     except Exception:  # noqa: BLE001
@@ -2501,11 +2572,15 @@ def fetch_json(req, timeout, limit):
         path += "?" + u.query
     result, box = {}, threading.Event()
     deadline = time.monotonic() + timeout + READ_GRACE
+    cancelled = threading.Event()
 
     def work():
         resp = None
         try:
             conn.connect()
+            result["sock"] = conn.sock             # 接続した直後に控える（締め切りで閉じるため）
+            if cancelled.is_set():                 # 締め切りのあとに接続できても、要求は送らない
+                return
             conn.request(req.get_method(), path, body=req.data, headers=dict(req.header_items()))
             resp = conn.getresponse()
             if resp.status >= 300:                   # エラーの応答も、同じ締め切りの中で読む（転送 3xx にも従わない）
@@ -2524,13 +2599,14 @@ def fetch_json(req, timeout, limit):
                     resp.close()
                 except Exception:  # noqa: BLE001
                     pass
-            _shutdown_conn(conn)
+            _shutdown_conn(conn, result.get("sock"))
             with _INFLIGHT_LOCK:
                 _INFLIGHT[0] -= 1
             box.set()
     threading.Thread(target=work, daemon=True, name="claude-room-fetch").start()
     if not box.wait(max(0.0, deadline - time.monotonic())):
-        _shutdown_conn(conn)                          # 読み書きを止めて、スレッドを終わらせる
+        cancelled.set()
+        _shutdown_conn(conn, result.get("sock"))     # 読み書きを止めて、スレッドを終わらせる
         raise ValueError("応答を受け取り終えるまでに時間がかかりすぎます")
     if "error" in result:
         raise result["error"]
@@ -2595,23 +2671,28 @@ def cmd_join(a):
     Agent(base, key, name, a).run()
 
 
+def _admin_json(base, secret, path, data=None):
+    """invite コマンド用の要求。鍵は送らず、部屋の秘密で要求に署名する。"""
+    method = "POST" if data is not None else "GET"
+    body = json.dumps(data).encode() if data is not None else b""
+    ts, nonce = str(int(time.time())), secrets.token_hex(16)
+    req = urllib.request.Request(base + path, method=method, data=body or None,
+                                 headers={"Content-Type": "application/json", "X-Admin-Ts": ts, "X-Admin-Nonce": nonce,
+                                          "X-Admin-Sig": admin_signature(secret, method, path, ts, nonce, body)})
+    return fetch_json(req, 15, MAX_RESPONSE)
+
+
 def cmd_invite(a):
-    path = DATA_DIR / "key"
-    if not path.exists():
-        sys.exit("ホストの鍵がありません。この PC で claude-room host を動かしてから使ってください")
-    key = path.read_text().strip()
     base = f"http://127.0.0.1:{a.port}"
-    # 鍵を送る前に、そのポートにいるのが本物の部屋かを確かめる
     inst = DATA_DIR / "instances" / str(a.port)
     try:
         secret = inst.read_text().strip()
-        ch = secrets.token_hex(16)
-        proof = fetch_json(urllib.request.Request(f"{base}/api/ping?challenge={ch}"), 10, MAX_ERROR_BODY).get("proof")
-        if not isinstance(proof, str) or not hmac.compare_digest(
-                proof, hmac.new(secret.encode(), ch.encode(), "sha256").hexdigest()):
-            sys.exit(f"ポート {a.port} にいるのは、この PC で開いた部屋ではありません。鍵は送りませんでした")
-    except (OSError, ValueError, AttributeError):
+    except OSError:
         sys.exit(f"部屋が開いていません（この PC で claude-room host を動かしてから使ってください。ポート {a.port}）")
+
+    def _get_json(url, key, data=None):
+        return _admin_json(base, secret, url[len(base):], data)
+    key = None
     try:
         if a.revoke:
             r = _get_json(base + "/api/invites/revoke", key, {"name": a.revoke})
@@ -2815,6 +2896,9 @@ function render(t){return esc(t).split(/```/).map((p,i)=>i%2?'<pre><code>'+p.rep
 function hhmm(ts){const d=new Date(ts*1000);return d.toLocaleTimeString('ja-JP',{hour:'2-digit',minute:'2-digit'})}
 function nearBottom(){const m=$('#main');return m.scrollHeight-m.scrollTop-m.clientHeight<120}
 function toBottom(){const m=$('#main');m.scrollTop=m.scrollHeight;$('#newbtn').style.display='none'}
+const MAX_SHOWN=2000;     // 画面に残す発言の数（それより古いものは消す。長く開いていても重くならないように）
+function trimOld(){while(msgs.length>MAX_SHOWN){const old=msgs.shift();seen.delete(old.seq)}
+  const list=$('#list');while(list.children.length>MAX_SHOWN)list.removeChild(list.firstChild)}
 function addMsg(m){
   if(seen.has(m.seq))return;seen.add(m.seq);msgs.push(m);lastSeq=Math.max(lastSeq,m.seq);
   const stick=nearBottom();let el=document.createElement('div');
@@ -2824,7 +2908,7 @@ function addMsg(m){
     el.innerHTML=`<div class="av ${c?'claude':''}" style="background:${c?color(m.name):'var(--human)'}">${esc(ini)}</div>
     <div class="body"><div class="meta"><b>${esc(m.name)}</b><span class="tag">${c?(PRODUCT[m.kind]||'AI'):'人間'}</span><span>${hhmm(m.ts)}</span><span>#${esc(String(m.seq))}</span></div>
     <div class="bubble">${render(m.text)}</div></div>`}
-  $('#list').appendChild(el);
+  $('#list').appendChild(el);trimOld();
   if(stick||m.name===ME)toBottom();else $('#newbtn').style.display='block';
 }
 const ST={idle:'待機中',thinking:'考え中',checking:'秘密チェック中',awaiting:'持ち主が確認中'};
