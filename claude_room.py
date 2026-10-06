@@ -414,6 +414,14 @@ class Room:
 class HardenedServer(ThreadingHTTPServer):
     """標準の ThreadingHTTPServer に、接続数の上限と、要求を送り終えるまでの制限時間を足したもの。"""
     daemon_threads = True
+    # Windows の SO_REUSEADDR は「ほかのプログラムが使っているポートにも割り込める」という意味になる
+    # （別のプログラムが部屋のポートを横取りできてしまう）。Windows では使わず、独占する設定にする
+    allow_reuse_address = os.name != "nt"
+
+    def server_bind(self):
+        if os.name == "nt" and hasattr(socket, "SO_EXCLUSIVEADDRUSE"):
+            self.socket.setsockopt(socket.SOL_SOCKET, socket.SO_EXCLUSIVEADDRUSE, 1)
+        super().server_bind()
 
     def __init__(self, *a, **kw):
         super().__init__(*a, **kw)
