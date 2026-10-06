@@ -222,7 +222,7 @@ class Room:
             "invite_bases": self.invite_bases,
         }
 
-    def post(self, name, kind, text, cid=None, check=None, who="host"):
+    def post(self, name, kind, text, cid=None, check=None, who="host", gen=None):
         """発言を部屋に加える。AI の発言は、発言権を持ち、止められていないときだけ受け付ける。
 
         check: 招待が取り消されていないかの確認。取り消しと同じロックの中で確かめる（すれ違いをなくす）。
@@ -243,6 +243,8 @@ class Room:
                     raise Denied(409, "AI は止められています")
                 if not (self.floor and self.floor[0] == name and self.floor[1] > now):
                     raise Denied(409, "発言権がありません")
+                if gen is not None and self.floor[2] != gen:
+                    raise Denied(409, "発言権が取り直されています（古い下書きは投稿できません）")
             msg = {"seq": self._last_seq() + 1, "ts": time.time(), "name": name,
                    "kind": kind, "text": text}
             try:     # 先にログへ書く。書けなければ、メモリにも加えない（ログと食い違わないように）
@@ -399,11 +401,11 @@ class Room:
                 self._bump()
             return ok, self.state()
 
-    def release(self, name, check=None):
+    def release(self, name, check=None, gen=None):
         with self.cond:
             if check is not None and not check():
                 raise Denied(401, "この招待は取り消されました")
-            if self.floor and self.floor[0] == name:
+            if self.floor and self.floor[0] == name and (gen is None or self.floor[2] == gen):
                 self.floor = None
                 self._bump()
             if name in self.agents and self.agents[name]["status"] != "idle":
@@ -670,7 +672,7 @@ def guest_names(name):
     return {name} | {f"{p}-{name}" for p in AI_KINDS}
 
 
-def make_handler(room, key, invites, trust_forwarded=False):
+def make_handler(room, key, invites, trust_forwarded=False, browser_key=None):
     class Handler(BaseHTTPRequestHandler):
         server_version = "claude-room"
         sys_version = ""
@@ -700,7 +702,9 @@ def make_handler(room, key, invites, trust_forwarded=False):
             """
             got = self.headers.get("Authorization", "")
             got = got[7:] if got.startswith("Bearer ") else ""
-            if got and secrets.compare_digest(got.encode(), key.encode()):
+            # ホストの鍵（永続。自分の AI と invite コマンドが使う）か、ブラウザ用の鍵（起動のたびに変わる）
+            if got and (secrets.compare_digest(got.encode(), key.encode()) or (
+                    browser_key and secrets.compare_digest(got.encode(), browser_key.encode()))):
                 self.who = {"role": "host", "name": room.host_name}
                 return self._count()
             inv = invites.find(got) if got else None
@@ -934,8 +938,10 @@ def make_handler(room, key, invites, trust_forwarded=False):
                 if not self.server.rate_ok(self.who.get("id", "host")):
                     return self._json(429, {"error": "投稿が多すぎます。少し待ってください"})
                 cid = str(d.get("cid") or "")[:64] or None
+                gen = d.get("gen")
                 return self._json(200, room.post(name, kind, text[:MAX_TEXT], cid=cid, check=self._check(),
-                                                 who=self.who.get("id", "host")))
+                                                 who=self.who.get("id", "host"),
+                                                 gen=gen if type(gen) is int else None))
             if path == "/api/control":
                 if not self.server.rate_ok(self.who.get("id", "host")):
                     return self._json(429, {"error": "操作が多すぎます。少し待ってください"})
@@ -950,7 +956,8 @@ def make_handler(room, key, invites, trust_forwarded=False):
                     gen = d.get("gen")
                     ok, st = room.claim(name, check=self._check(), gen=gen if type(gen) is int else None)
                     return self._json(200, {"ok": ok, "state": st})
-                room.release(name, check=self._check())
+                gen = d.get("gen")
+                room.release(name, check=self._check(), gen=gen if type(gen) is int else None)
                 return self._json(200, {"ok": True})
             if path == "/api/status":
                 status = str(d.get("status") or "idle")
@@ -986,11 +993,11 @@ def make_handler(room, key, invites, trust_forwarded=False):
     return Handler
 
 
-def serve(room, key, invites, binds, port, trust_forwarded=False):
+def serve(room, key, invites, binds, port, trust_forwarded=False, browser_key=None):
     servers = []
     for host in binds:
         try:
-            srv = HardenedServer((host, port), make_handler(room, key, invites, trust_forwarded))
+            srv = HardenedServer((host, port), make_handler(room, key, invites, trust_forwarded, browser_key))
         except OSError as e:
             # 一部だけで待ち受けを続けない。127.0.0.1 を別のプログラムに取られたまま続けると、
             # invite コマンドがそのプログラムにホストの鍵を渡してしまう
@@ -1438,11 +1445,13 @@ class Agent:
         rec_dir = _ensure_dir(DATA_DIR / "records" / self.me)
         self.record_path = rec_dir / f"{time.strftime('%Y%m%d-%H%M%S')}-{secrets.token_hex(3)}.jsonl"
         self._record_warned = False
+        self._ai_calls = 0            # AI を呼んだ回数（返答・秘密チェック・書き直しのすべて）
+        self._limit_logged = False
         self._floor_gen = None
         self._sessions = set()
         atexit.register(self.forget_sessions)
         self._fails = {}
-        self._replies = 0
+
         self._q = f"&name={quote(self.me)}&owner={quote(self.owner)}&agent={self.product}"
 
     def _setup_claude(self):
@@ -1512,8 +1521,7 @@ class Agent:
             data=json.dumps(data).encode() if data is not None else None,
             headers={"Authorization": "Bearer " + self.key, "Content-Type": "application/json"})
         try:
-            with _OPENER.open(req, timeout=timeout) as r:
-                return read_json(r, MAX_RESPONSE, deadline=time.monotonic() + timeout + READ_GRACE)
+            return fetch_json(req, timeout, MAX_RESPONSE)
         except urllib.error.HTTPError as e:
             if e.code in (401, 403):
                 msg = _http_error(e)
@@ -1706,10 +1714,10 @@ class Agent:
             return
         if self._halted(st):
             return
-        if self.args.max_replies and self._replies >= self.args.max_replies:
-            if self._replies == self.args.max_replies:
+        if self.args.max_replies and self._ai_calls >= self.args.max_replies:
+            if not self._limit_logged:
+                self._limit_logged = True
                 log(f"AI を呼ぶ回数の上限（--max-replies {self.args.max_replies}）に達したので、これ以上は返答しません")
-                self._replies += 1
             return
         if not self._addressed(latest):
             self.replied_upto = latest["seq"]
@@ -1730,7 +1738,6 @@ class Agent:
             upto = self.history[-1]["seq"]
             log(f"← {', '.join(sorted({m['name'] for m in talk}))} の発言 {len(talk)} 件に返答を作っています…")
             turn = self.panel.new_turn(talk)
-            self._replies += 1                  # AI を呼ぶ前に数える（投稿できなくても、費用はかかるため）
             try:
                 reply = self.compose(turn, talk)
             except Kicked:
@@ -1767,9 +1774,9 @@ class Agent:
         finally:
             if turn is not None:
                 self._record(turn)             # 発言権を手放す前に記録する（手放すのに失敗しても記録は残る）
-            self._floor_gen = None
+            gen, self._floor_gen = self._floor_gen, None
             try:
-                self.api("POST", "/api/floor", {"name": self.me, "action": "release"})
+                self.api("POST", "/api/floor", {"name": self.me, "action": "release", "gen": gen})
             except (OSError, ValueError):
                 pass                           # 手放せなくても、期限が来れば外れる
 
@@ -1778,7 +1785,8 @@ class Agent:
         cid = secrets.token_hex(8)
         for attempt in range(4):
             try:
-                self.api("POST", "/api/send", {"name": self.me, "kind": self.product, "text": reply, "cid": cid})
+                self.api("POST", "/api/send", {"name": self.me, "kind": self.product, "text": reply, "cid": cid,
+                                               "gen": self._floor_gen})
                 return True
             except urllib.error.HTTPError as e:
                 if e.code == 409:
@@ -1949,6 +1957,9 @@ class Agent:
         秘密の設定を含む指示は、起動引数ではなく、本人だけが読めるファイル（0600）で渡し、終わったら消す
         （起動引数は、同じ PC のほかのプロセスから ps などで見えるため）。
         """
+        self._ai_calls += 1
+        if self.args.max_replies and self._ai_calls > self.args.max_replies:
+            raise RuntimeError(f"AI を呼ぶ回数の上限（--max-replies {self.args.max_replies}）に達しました")
         if self.product == "codex":
             return self._run_codex(prompt, system, model, resume, checker)
         path = _private_file(system)
@@ -2020,6 +2031,14 @@ class Agent:
                              text=True, encoding="utf-8", errors="replace", cwd=self.args.workdir,
                              start_new_session=posix, env=env)
         job = None if posix else _WindowsJob.attach(p)
+        if not posix and job is None:
+            # Job Object に入れられないと、AI の子孫のプロセスを確実に止められない。その状態では動かさない
+            try:
+                p.kill()
+                p.communicate()
+            except OSError:
+                pass
+            raise RuntimeError("Windows の Job Object を使えないため、AI を安全に止められません。中止します")
 
         def kill():
             # プロセスグループごと止める（AI が起こした孫のプロセスも残さない。直接の子が先に終わっていても）
@@ -2134,6 +2153,16 @@ class _WindowsJob:
             import ctypes
             from ctypes import wintypes
             k32 = ctypes.windll.kernel32
+            k32.CreateJobObjectW.argtypes = [ctypes.c_void_p, wintypes.LPCWSTR]
+            k32.CreateJobObjectW.restype = wintypes.HANDLE
+            k32.SetInformationJobObject.argtypes = [wintypes.HANDLE, ctypes.c_int, ctypes.c_void_p, wintypes.DWORD]
+            k32.SetInformationJobObject.restype = wintypes.BOOL
+            k32.AssignProcessToJobObject.argtypes = [wintypes.HANDLE, wintypes.HANDLE]
+            k32.AssignProcessToJobObject.restype = wintypes.BOOL
+            k32.TerminateJobObject.argtypes = [wintypes.HANDLE, wintypes.UINT]
+            k32.TerminateJobObject.restype = wintypes.BOOL
+            k32.CloseHandle.argtypes = [wintypes.HANDLE]
+            k32.CloseHandle.restype = wintypes.BOOL
             job = k32.CreateJobObjectW(None, None)
             if not job:
                 return None
@@ -2156,8 +2185,8 @@ class _WindowsJob:
                             ("PeakProcessMemoryUsed", ctypes.c_size_t), ("PeakJobMemoryUsed", ctypes.c_size_t)]
             info = JOBOBJECT_EXTENDED_LIMIT_INFORMATION()
             info.BasicLimitInformation.LimitFlags = 0x2000     # JOB_OBJECT_LIMIT_KILL_ON_JOB_CLOSE
-            k32.SetInformationJobObject(job, 9, ctypes.byref(info), ctypes.sizeof(info))   # ExtendedLimitInformation
-            if not k32.AssignProcessToJobObject(job, wintypes.HANDLE(p._handle)):
+            ok = k32.SetInformationJobObject(job, 9, ctypes.byref(info), ctypes.sizeof(info))  # ExtendedLimitInformation
+            if not ok or not k32.AssignProcessToJobObject(job, wintypes.HANDLE(p._handle)):
                 k32.CloseHandle(job)
                 return None
             return cls(job, k32)
@@ -2176,20 +2205,39 @@ def _cleanup_stale(root):
     """強制終了などで残った、持ち主のプロセスがもういない Codex の設定フォルダを消す。"""
     for d in root.iterdir():
         try:
-            if os.name != "posix":
-                # Windows の os.kill(pid, 0) は、確かめるのではなくプロセスを止めてしまうので使わない。
-                # 代わりに、1 日より古いものだけを消す
-                if time.time() - d.stat().st_mtime > 86400:
-                    shutil.rmtree(str(d), ignore_errors=True)
-                continue
             pid = int(d.name.rsplit("-", 2)[-2])
-            os.kill(pid, 0)              # POSIX では、プロセスがいるかを確かめるだけ
         except (ValueError, IndexError):
             continue
-        except ProcessLookupError:
+        if _pid_alive(pid) is False:     # 持ち主のプロセスが確かにいないときだけ消す（分からなければ残す）
             shutil.rmtree(str(d), ignore_errors=True)
+
+
+def _pid_alive(pid):
+    """プロセスがいるか。True / False / None（分からない）。Windows の os.kill(pid, 0) はプロセスを止めてしまうので使わない。"""
+    if os.name == "posix":
+        try:
+            os.kill(pid, 0)
+            return True
+        except ProcessLookupError:
+            return False
         except OSError:
-            pass
+            return None
+    try:
+        import ctypes
+        from ctypes import wintypes
+        k32 = ctypes.windll.kernel32
+        k32.OpenProcess.argtypes = [wintypes.DWORD, wintypes.BOOL, wintypes.DWORD]
+        k32.OpenProcess.restype = wintypes.HANDLE
+        h = k32.OpenProcess(0x1000, False, pid)        # PROCESS_QUERY_LIMITED_INFORMATION
+        if not h:
+            return False if k32.GetLastError() == 87 else None     # 87 = ERROR_INVALID_PARAMETER（そのプロセスはいない）
+        code = wintypes.DWORD()
+        k32.GetExitCodeProcess.argtypes = [wintypes.HANDLE, ctypes.POINTER(wintypes.DWORD)]
+        alive = bool(k32.GetExitCodeProcess(h, ctypes.byref(code))) and code.value == 259   # STILL_ACTIVE
+        k32.CloseHandle(h)
+        return alive
+    except Exception:  # noqa: BLE001
+        return None
 
 
 def _cleanup_old_run_files():
@@ -2236,7 +2284,8 @@ def add_agent_args(p):
     p.add_argument("--confirm", action="store_true", help="すべての投稿の前に、代理人パネルで確認する")
     p.add_argument("--timeout", type=int, default=900, help="1 回の返答の制限時間（秒）")
     p.add_argument("--max-replies", type=int, default=0,
-                   help="自分の AI が返答を作る回数の上限（投稿できなかった分も数える。既定 0＝上限なし。費用の目安として）")
+                   help="自分の AI を呼ぶ回数の上限（返答・秘密チェック・書き直しをすべて数える。既定 0＝上限なし。"
+                        "1 回あたりの費用は変わるので、金額の上限ではなく目安）")
 
 
 def print_invite(base, inv_key, name):
@@ -2256,6 +2305,9 @@ def _room_name(v):
 
 def cmd_host(a):
     key = load_key(a.new_key)
+    # ブラウザには、永続のホストの鍵ではなく、起動のたびに変わる鍵を渡す。部屋を閉じたあとにタブが残って
+    # 再接続し続けても、別のプログラムに渡るのは、もう使えない鍵だけになる
+    browser_key = secrets.token_urlsafe(24)
     _, log_path, inv_path = room_paths(a.room)                  # 部屋ごとのフォルダ（ほかの部屋とぶつからない）
     if a.fresh:
         stamp = time.strftime("%Y%m%d-%H%M%S")
@@ -2275,19 +2327,21 @@ def cmd_host(a):
     invites.reserved = {a.name}                                # ホストの名前は、どの経路でも招待に使えない
     if a.public:
         # 公開するときは 127.0.0.1 だけで待ち受け、Funnel 経由でだけ外から届くようにする
-        up = serve(room, key, invites, ["127.0.0.1"], a.port, trust_forwarded=True)
+        up = serve(room, key, invites, ["127.0.0.1"], a.port, trust_forwarded=True, browser_key=browser_key)
         room.invite_bases = [start_funnel(a.port, a.public_port)]
         public = room.invite_bases
     else:
-        binds = a.bind or [b for b in (tailscale_ip(), "127.0.0.1") if b]
-        up = serve(room, key, invites, binds, a.port)
+        binds = a.bind or [b for b in (tailscale_ip(),) if b]
+        if "127.0.0.1" not in binds:      # 管理用の 127.0.0.1 は必ず待ち受ける（別のプログラムに取られないように）
+            binds.append("127.0.0.1")
+        up = serve(room, key, invites, binds, a.port, browser_key=browser_key)
         public = [h for h in up if not h.startswith("127.")]
         room.invite_bases = [f"http://{h}:{a.port}" for h in public]
 
     print()
     print(f"  Claude Room   ルーム「{a.room}」   ホスト: {a.name}")
-    print(f"  自分のブラウザ :  http://127.0.0.1:{a.port}/#key={key}")
-    print("  ※ これはホストの鍵です。人には渡さないでください")
+    print(f"  自分のブラウザ :  http://127.0.0.1:{a.port}/#key={browser_key}")
+    print("  ※ ホスト用の URL です。人には渡さないでください（この鍵は、部屋を閉じると使えなくなります）")
     print()
     base = (room.invite_bases or [f"http://127.0.0.1:{a.port}"])[0]
     for name in a.invite or []:
@@ -2350,12 +2404,17 @@ def read_json(resp, limit, deadline=None):
     return parse_json(b"".join(chunks))
 
 
+_JSON_STRING_RE = re.compile(rb'"(?:[^"\\]|\\.)*"')
+
+
 def parse_json(data, max_objects=MAX_JSON_OBJECTS):
     """JSON を読む。壊れている・入れ子が深すぎる（RecursionError）・オブジェクトが多すぎるときは ValueError。
 
     オブジェクトの数を数えるのは、{} を大量に並べた小さな応答で、大量のメモリを使わせる攻撃を防ぐため。
     """
-    if data.count(b"[") + data.count(b"{") > MAX_JSON_BRACKETS:
+    # 文字列の中の [ { は数えない（発言の本文に括弧が多いだけで、履歴が読めなくならないように）
+    structural = _JSON_STRING_RE.sub(b"", data)
+    if structural.count(b"[") + structural.count(b"{") > MAX_JSON_BRACKETS:
         raise ValueError("配列やオブジェクトが多すぎます")
     count = [0]
 
@@ -2370,18 +2429,42 @@ def parse_json(data, max_objects=MAX_JSON_OBJECTS):
         raise ValueError("JSON として読めないか、入れ子が深すぎるか、大きすぎます")
 
 
+def fetch_json(req, timeout, limit):
+    """要求を送り、JSON の応答を受け取る。接続・ヘッダー・本文を含む通信全体に、締め切り（timeout + READ_GRACE）を置く。
+
+    ソケットの timeout は 1 回の読み書きの制限で、ヘッダーや chunked の区切りを少しずつ送られると、
+    全体では長く待たされうる。そこで通信を別のスレッドで行い、締め切りを過ぎたら待つのをやめる
+    （そのスレッドは、ソケットの時間切れでいずれ終わる）。
+    """
+    result, box = {}, threading.Event()
+
+    def work():
+        try:
+            with _OPENER.open(req, timeout=min(timeout, 10)) as r:
+                result["value"] = read_json(r, limit, deadline=time.monotonic() + timeout + READ_GRACE)
+        except BaseException as e:  # noqa: BLE001 — 例外は呼び出し元へ渡す
+            result["error"] = e
+        finally:
+            box.set()
+    threading.Thread(target=work, daemon=True).start()
+    if not box.wait(timeout + READ_GRACE):
+        raise ValueError("応答を受け取り終えるまでに時間がかかりすぎます")
+    if "error" in result:
+        raise result["error"]
+    return result["value"]
+
+
 def _get_json(url, key, data=None):
     req = urllib.request.Request(url, method="POST" if data is not None else "GET",
                                  data=json.dumps(data).encode() if data is not None else None,
                                  headers={"Authorization": "Bearer " + key, "Content-Type": "application/json"})
-    with _OPENER.open(req, timeout=15) as r:
-        return read_json(r, MAX_RESPONSE, deadline=time.monotonic() + 15 + READ_GRACE)
+    return fetch_json(req, 15, MAX_RESPONSE)
 
 
 def _http_error(e):
     """エラーの応答から説明を取り出す（大きさを限り、形も確かめる）。"""
     try:
-        body = read_json(e, MAX_ERROR_BODY)
+        body = read_json(e, MAX_ERROR_BODY, deadline=time.monotonic() + 5)
         msg = body.get("error") if isinstance(body, dict) else None
         return str(msg)[:300] if msg else str(e)
     except (ValueError, OSError):
@@ -2389,22 +2472,17 @@ def _http_error(e):
 
 
 def cmd_join(a):
-    url = a.url
+    # 招待URLは鍵そのもの。コマンドの引数に書くと、同じ PC のほかの利用者からプロセスの一覧で見えることが
+    # あるので、聞いて受け取る（画面には出さない）。パイプからでも受け取れる
+    try:
+        url = (getpass.getpass("招待URLを貼ってください（表示されません）: ") if sys.stdin.isatty()
+               else sys.stdin.readline()).strip()
+    except (EOFError, OSError):
+        url = ""
     if not url:
-        # 招待URLは鍵そのもの。コマンドの引数に書くと、同じ PC のほかの利用者からプロセスの一覧で見えることが
-        # あるので、聞いて受け取る（画面には出さない）。パイプからでも受け取れる
-        try:
-            url = (getpass.getpass("招待URLを貼ってください（表示されません）: ") if sys.stdin.isatty()
-                   else sys.stdin.readline()).strip()
-        except (EOFError, OSError):
-            url = ""
-        if not url:
-            sys.exit("招待URLが入力されませんでした")
-    elif sys.stdin.isatty():
-        log("[注意] 招待URLをコマンドの引数に書くと、同じ PC のほかの利用者に見えることがあります。"
-            "次からは、URL を付けずに claude-room join と打ち、聞かれたときに貼ってください")
+        sys.exit("招待URLが入力されませんでした")
     u = urlparse(url)
-    key = a.key or parse_qs(u.fragment).get("key", [""])[0] or parse_qs(u.query).get("key", [""])[0]
+    key = parse_qs(u.fragment).get("key", [""])[0] or parse_qs(u.query).get("key", [""])[0]
     if not key:
         sys.exit("URL に #key=... が含まれていません（招待URLをそのまま貼ってください）")
     if u.scheme not in ("http", "https") or not u.netloc:
@@ -2495,8 +2573,7 @@ def main():
     h.set_defaults(func=cmd_host)
     h.add_argument("--invite", action="append", metavar="NAME", help="起動と同時に、この人への招待を作る（何回でも指定できる）")
     j = sub.add_parser("join", help="招待URLで部屋に入る")
-    j.add_argument("url", nargs="?", help="招待URL（省略すると、起動後に聞く。鍵が引数に残らないので、そのほうが安全）")
-    j.add_argument("--key", help=argparse.SUPPRESS)
+    # 招待URL（鍵）は引数で受け取らない。起動後に聞くか、標準入力から読む（引数はプロセスの一覧に残るため）
     add_agent_args(j)
     j.set_defaults(func=cmd_join, name=None)
     v = sub.add_parser("invite", help="相手ごとの招待を作る・一覧を見る・取り消す（部屋を開いている PC で）")

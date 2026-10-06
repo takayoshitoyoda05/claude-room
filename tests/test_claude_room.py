@@ -375,6 +375,54 @@ class ServerTests(unittest.TestCase):
         with self.assertRaises(SystemExit):
             cr.serve(self.room, self.key, self.invites, ["127.0.0.1"], port)
 
+    def test_explicit_bind_still_requires_localhost(self):
+        # --bind で別のアドレスを指定しても、管理用の 127.0.0.1 は必ず待ち受ける（空いていれば取る、使われていれば止まる）
+        port = self.srv.server_address[1]
+        with self.assertRaises(SystemExit):
+            cr.cmd_host(argparse.Namespace(name="alice", room="bindtest", bind=["127.0.0.2"], port=port, max_turns=0,
+                                           public=False, public_port=443, no_claude=True, new_key=False, fresh=False,
+                                           invite=None, agent="claude", tools=None, model=None, workdir=None,
+                                           policy=None, guard="auto", max_rewrites=2, check_model=None,
+                                           panel_port=0, confirm=False, timeout=900, max_replies=0))
+
+    def test_browser_key_is_per_start_and_host_key_still_works(self):
+        d = Path(tempfile.mkdtemp(dir=_TMP))
+        room = cr.Room("b", d / "log.jsonl", 0)
+        room.host_name = "alice"
+        bkey = "browser-" + "b" * 24
+        srv = cr.HardenedServer(("127.0.0.1", 0), cr.make_handler(room, self.key, cr.Invites(d / "i.json"), False, bkey))
+        threading.Thread(target=srv.serve_forever, daemon=True).start()
+        self.addCleanup(lambda: (srv.shutdown(), srv.server_close()))
+        base = f"http://127.0.0.1:{srv.server_address[1]}"
+        self.assertEqual(call(base, "/api/me", bkey)[1]["role"], "host")            # ブラウザ用の鍵もホストとして通る
+        self.assertEqual(call(base, "/api/me", self.key)[1]["role"], "host")        # 永続の鍵は AI と invite 用
+        srv2 = cr.HardenedServer(("127.0.0.1", 0), cr.make_handler(room, self.key, cr.Invites(d / "i.json"), False, "other"))
+        threading.Thread(target=srv2.serve_forever, daemon=True).start()
+        self.addCleanup(lambda: (srv2.shutdown(), srv2.server_close()))
+        self.assertEqual(call(f"http://127.0.0.1:{srv2.server_address[1]}", "/api/me", bkey)[0], 401)   # 次の起動では無効
+
+    def test_stale_post_and_release_after_reclaim(self):
+        self.join(self.bob, "bob")
+        g1 = call(self.base, "/api/floor", self.bob, {"name": "claude-bob", "action": "claim"})[1]["state"]["floor_gen"]
+        call(self.base, "/api/control", self.bob, {"by": "bob", "paused": True})
+        call(self.base, "/api/control", self.bob, {"by": "bob", "paused": False})
+        g2 = call(self.base, "/api/floor", self.bob, {"name": "claude-bob", "action": "claim"})[1]["state"]["floor_gen"]
+        self.assertNotEqual(g1, g2)
+        old = call(self.base, "/api/send", self.bob, {"name": "claude-bob", "kind": "claude", "text": "古い", "gen": g1})[0]
+        self.assertEqual(old, 409)                                # 古い世代の投稿は通らない
+        call(self.base, "/api/floor", self.bob, {"name": "claude-bob", "action": "release", "gen": g1})
+        self.assertIsNotNone(self.room.floor)                     # 古い世代の解放は、新しい発言権を外さない
+        new = call(self.base, "/api/send", self.bob, {"name": "claude-bob", "kind": "claude", "text": "新しい", "gen": g2})[0]
+        self.assertEqual(new, 200)
+
+    def test_bracket_heavy_posts_remain_readable(self):
+        for _ in range(11):
+            self.assertEqual(call(self.base, "/api/send", self.bob, {"name": "bob", "text": "[" * 20000})[0], 200)
+        ag = object.__new__(cr.Agent)
+        ag.base, ag.key, ag.history, ag.v, ag.room = self.base, self.carol, [], -1, "r"
+        ag._absorb(ag.api("GET", "/api/messages?tail=1"))         # 正しい投稿だけで作られた履歴は、必ず読める
+        self.assertEqual(len(ag.history), 11)
+
     def test_active_requests_per_guest(self):
         for i in range(200):
             self.room.post("alice", "human", "あ" * 10000)             # UTF-8 で約 6 MB の応答になる
@@ -629,7 +677,6 @@ class PublicModeTests(unittest.TestCase):
         self.assertLess(len(srv._posts), 21000)
         self.assertLess(len(srv._fails), 21000)
 
-    @unittest.skipUnless(POSIX, "POSIX のプロセス確認")
     def test_cleanup_stale_codex_homes(self):
         root = Path(tempfile.mkdtemp(dir=_TMP))
         dead = subprocess.Popen([sys.executable, "-c", "pass"])
@@ -677,13 +724,23 @@ class FakeHost:
         self.srv.server_close()
 
 
+def join_with(url):
+    """招待URLを標準入力から渡して cmd_join を呼ぶ（引数では受け取らない）。"""
+    import io
+    old = sys.stdin
+    sys.stdin = io.StringIO(url + "\n")
+    try:
+        cr.cmd_join(argparse.Namespace(name=None))
+    finally:
+        sys.stdin = old
+
+
 class MaliciousHostTests(unittest.TestCase):
     def test_join_rejects_bad_name(self):
         host = FakeHost({"/api/me": {"role": "guest", "name": "claude-/../../.."}})
         try:
-            a = argparse.Namespace(url=host.base + "/#key=abc", key=None, name=None)
             with self.assertRaises(SystemExit):
-                cr.cmd_join(a)
+                join_with(host.base + "/#key=abc")
         finally:
             host.close()
 
@@ -734,7 +791,7 @@ class MaliciousHostTests(unittest.TestCase):
         host = FakeHost({"/api/me": (200, b"not json")})
         try:
             with self.assertRaises(SystemExit):
-                cr.cmd_join(argparse.Namespace(url=host.base + "/#key=abc", key=None, name=None))
+                join_with(host.base + "/#key=abc")
         finally:
             host.close()
 
@@ -785,7 +842,7 @@ class MaliciousHostTests(unittest.TestCase):
                 ag.api("GET", "/api/messages")
             cm.exception.close()
             with self.assertRaises(SystemExit):
-                cr.cmd_join(argparse.Namespace(url=host.base + "/#key=SECRET", key=None, name=None))
+                join_with(host.base + "/#key=SECRET")
             self.assertEqual(hits, [])                             # 転送先には、一度もアクセスしない
         finally:
             host.close()
@@ -827,6 +884,60 @@ class MaliciousHostTests(unittest.TestCase):
             cr.READ_GRACE = old
             srv.shutdown()
             srv.server_close()
+
+    def _drip_server(self, mode):
+        class Drip(BaseHTTPRequestHandler):
+            protocol_version = "HTTP/1.1"
+
+            def log_message(self, *a):
+                pass
+
+            def do_GET(self):
+                try:
+                    if mode == "headers":
+                        self.wfile.write(b"HTTP/1.1 200 OK\r\n")
+                        for i in range(200):
+                            self.wfile.write(f"X-Slow-{i}: a\r\n".encode())
+                            self.wfile.flush()
+                            time.sleep(0.3)
+                    elif mode == "401":
+                        self.send_response(401)
+                        self.send_header("Content-Length", "100000")
+                        self.end_headers()
+                        for _ in range(1000):
+                            self.wfile.write(b" " * 100)
+                            self.wfile.flush()
+                            time.sleep(0.3)
+                    else:   # chunked のトレーラーを少しずつ
+                        self.send_response(200)
+                        self.send_header("Transfer-Encoding", "chunked")
+                        self.end_headers()
+                        self.wfile.write(b"2\r\n{}\r\n")
+                        self.wfile.flush()
+                        for _ in range(100):
+                            self.wfile.write(b"0")
+                            self.wfile.flush()
+                            time.sleep(0.3)
+                except OSError:
+                    pass
+        srv = ThreadingHTTPServer(("127.0.0.1", 0), Drip)
+        threading.Thread(target=srv.serve_forever, daemon=True).start()
+        self.addCleanup(lambda: (srv.shutdown(), srv.server_close()))
+        return f"http://127.0.0.1:{srv.server_address[1]}"
+
+    def test_slow_headers_401_and_chunked_have_deadline(self):
+        old = cr.READ_GRACE
+        cr.READ_GRACE = 1
+        try:
+            for mode in ("headers", "401", "chunked"):
+                ag = object.__new__(cr.Agent)
+                ag.base, ag.key = self._drip_server(mode), "k"
+                t = time.time()
+                with self.assertRaises((ValueError, cr.Kicked, OSError)):
+                    ag.api("GET", "/x", timeout=1)
+                self.assertLess(time.time() - t, 10, mode)        # どの形でも、締め切りで戻る
+        finally:
+            cr.READ_GRACE = old
 
     def test_many_objects_rejected(self):
         with self.assertRaises(ValueError):
@@ -942,26 +1053,31 @@ class SecretCheckTests(unittest.TestCase):
             self.assertFalse(v["ok"], bad)
             self.assertEqual(v["by"], "error", bad)
 
-    def test_max_replies_counts_generations(self):
-        ag = self._agent('{"leak": false}')
-        ag.guarded, ag.session, ag.owner, ag.product = False, "s", "alice", "claude"
-        ag.args = argparse.Namespace(check_model=None, model=None, confirm=False, guard="auto", max_rewrites=2,
-                                     max_replies=1)
-        ag.keep_floor, ag._floor_gen, ag._replies, ag.replied_upto, ag._fails = (lambda: True), 1, 0, 0, {}
-        ag.panel = argparse.Namespace(step=lambda *a, **k: None, set=lambda *a, **k: None,
-                                      new_turn=lambda talk: {"id": 1, "steps": []})
-        ag.history = [{"seq": 1, "ts": 0, "name": "bob", "kind": "human", "text": "@claude-alice こんにちは"}]
+    def test_max_replies_counts_every_ai_call(self):
+        # 返答の生成・秘密チェック・書き直しのすべてを数え、上限に達したら AI を呼ばない
+        ag = self._agent('{"leak": true, "reasons": ["x"], "quotes": [], "hint": ""}')
+        ag.guarded, ag.session, ag.owner, ag.product, ag.me = True, "s", "alice", "claude", "claude-alice"
+        ag.args = argparse.Namespace(check_model=None, model=None, confirm=False, guard="auto", max_rewrites=5,
+                                     max_replies=4, tools="")
+        ag._ai_calls, ag._limit_logged, ag.bin, ag.label, ag.policy_text = 0, False, "claude", "Claude", "## 秘密\n- x"
+        ag.keep_floor, ag._floor_gen = (lambda: True), 1
+        ag.panel = argparse.Namespace(step=lambda *a, **k: None, set=lambda *a, **k: None, url="http://x",
+                                      wait_decision=lambda *a, **k: {"action": "discard", "text": ""})
+        ag._status = lambda s: None
         calls = []
-        ag.ask_ai = lambda prompt: calls.append(1) or "返事"
-        ag._halted_now = lambda: False
-        ag._addressed = lambda m: True
-        ag._post_reply = lambda reply: False                      # ホストが投稿を拒否し続ける
-        ag._record = lambda turn: None
-        st = {"paused": False, "max_turns": 0, "auto_turns": 0, "agents": [], "version": 1, "room": "r", "floor_gen": None}
-        ag.api = lambda *a, **k: {"ok": True, "state": st, "messages": []}
-        for _ in range(4):
-            ag.maybe_reply(st)
-        self.assertEqual(len(calls), 1)                            # 投稿できなくても、生成は 1 回で止まる
+
+        def fake_run_process(cmd, prompt, env=None):
+            calls.append(cmd)
+            is_check = any("検査役" in open(cmd[cmd.index("--append-system-prompt-file") + 1], encoding="utf-8").read()
+                           for _ in [0])
+            body = ('{"leak": true, "reasons": ["x"], "quotes": [], "hint": ""}' if is_check else "下書き")
+            return json.dumps({"result": body, "session_id": "s"}), "", 0
+        ag._run_process = fake_run_process
+        del ag._run_ai                                              # _agent() が置いた偽物を外し、本物の数え方を通す
+        ag._sessions = set()
+        with self.assertRaises(RuntimeError):                      # 上限を超えたら、呼ぶ前に止まる
+            ag.compose({}, [{"seq": 1, "ts": 0, "name": "bob", "kind": "human", "text": "@claude-alice hi"}])
+        self.assertEqual(len(calls), 4)                             # 生成・検査・生成・検査 で 4 回
 
     def test_pass_on_direct_mention_is_rechecked(self):
         ag = self._agent('{"leak": false}')
@@ -1038,8 +1154,8 @@ class SessionCleanupTests(unittest.TestCase):
 class SessionIdTests(unittest.TestCase):
     def test_session_id_is_registered_before_run(self):
         ag = object.__new__(cr.Agent)
-        ag.product, ag.bin, ag._sessions = "claude", "claude", set()
-        ag.args = argparse.Namespace(tools="")
+        ag.product, ag.bin, ag._sessions, ag._ai_calls = "claude", "claude", set(), 0
+        ag.args = argparse.Namespace(tools="", max_replies=0)
         seen = {}
 
         def fake_run(cmd, prompt, env=None):
