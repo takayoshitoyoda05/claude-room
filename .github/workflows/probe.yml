@@ -14,7 +14,7 @@ jobs:
       - name: 外から 3 通りの要求を送る（ふつう／偽の送信元ヘッダー／重複したヘッダー）
         run: |
           U="${{ inputs.url }}"
-          echo "== plain"; curl -sS --max-time 20 "$U/plain"; echo
+          echo "== plain"; curl -sS -4 -v --max-time 20 "$U/plain" 2>&1 | grep -E "Trying|SSL|HTTP/|^\{" | head -8; echo
           echo "== spoof"; curl -sS --max-time 20 -H "X-Forwarded-For: 1.2.3.4" -H "Tailscale-Funnel-Request: ?1" "$U/spoof"; echo
           echo "== dup";   curl -sS --max-time 20 -H "X-Forwarded-For: 5.6.7.8" -H "X-Forwarded-For: 9.9.9.9" "$U/dup"; echo
           echo "== myip";  curl -sS --max-time 20 https://api.ipify.org; echo
