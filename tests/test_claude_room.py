@@ -136,6 +136,11 @@ class ServerTests(unittest.TestCase):
         self.srv.shutdown()
         self.srv.server_close()
 
+    def claim(self, key, name):
+        r = call(self.base, "/api/floor", key, {"name": name, "action": "claim"})[1]
+        self.assertTrue(r["ok"])
+        return r["state"]["floor_gen"]
+
     def join(self, key, human, product="claude"):
         """生存の合図で AI を部屋に登録する（発言権を取れるのは、登録された AI だけ）。"""
         q = f"/api/wait?timeout=0&v=-2&after=999999&agent={product}&owner={human}&name={product}-{human}"
@@ -159,16 +164,18 @@ class ServerTests(unittest.TestCase):
         self.assertEqual(call(self.base, "/api/invites", self.bob, {"name": "mallory"})[0], 403)
 
     def test_ai_post_needs_floor_and_not_paused(self):
-        post = {"name": "claude-bob", "kind": "claude", "text": "hello"}
+        post = {"name": "claude-bob", "kind": "claude", "text": "hello", "gen": 0}
         self.assertEqual(call(self.base, "/api/send", self.bob, post)[0], 409)     # 発言権なし
         self.assertFalse(call(self.base, "/api/floor", self.bob, {"name": "claude-bob", "action": "claim"})[1]["ok"])
         self.join(self.bob, "bob")                                                 # 登録すると取れる
-        self.assertEqual(call(self.base, "/api/floor", self.bob, {"name": "claude-bob", "action": "claim"})[1]["ok"],
-                         True)
+        gen = self.claim(self.bob, "claude-bob")
+        del post["gen"]
+        self.assertEqual(call(self.base, "/api/send", self.bob, post)[0], 400)     # 世代番号なしの AI 投稿は断る
+        post["gen"] = gen
         call(self.base, "/api/control", self.carol, {"by": "carol", "paused": True})
         self.assertEqual(call(self.base, "/api/send", self.bob, post)[0], 409)     # 止められている
         call(self.base, "/api/control", self.carol, {"by": "carol", "paused": False})
-        call(self.base, "/api/floor", self.bob, {"name": "claude-bob", "action": "claim"})
+        post["gen"] = self.claim(self.bob, "claude-bob")
         self.assertEqual(call(self.base, "/api/send", self.bob, post)[0], 200)
 
     def test_floor_needs_ai_name(self):
@@ -350,7 +357,7 @@ class ServerTests(unittest.TestCase):
 
     def test_stopping_releases_floor(self):
         self.join(self.bob, "bob")
-        self.assertTrue(call(self.base, "/api/floor", self.bob, {"name": "claude-bob", "action": "claim"})[1]["ok"])
+        self.claim(self.bob, "claude-bob")
         call(self.base, "/api/control", self.key, {"by": "alice", "agent": "claude-bob", "muted": True})
         self.assertIsNone(self.room.floor)                       # 止めた AI の発言権は外れる
         call(self.base, "/api/control", self.key, {"by": "alice", "agent": "claude-bob", "muted": False})
@@ -367,7 +374,7 @@ class ServerTests(unittest.TestCase):
         call(self.base, "/api/control", self.bob, {"by": "bob", "paused": False})      # すぐ再開
         renew = call(self.base, "/api/floor", self.bob, {"name": "claude-bob", "action": "claim", "gen": gen})[1]
         self.assertFalse(renew["ok"])                             # 古い世代の延長は通らない（下書きは捨てられる）
-        post = call(self.base, "/api/send", self.bob, {"name": "claude-bob", "kind": "claude", "text": "古い下書き"})[0]
+        post = call(self.base, "/api/send", self.bob, {"name": "claude-bob", "kind": "claude", "text": "古い下書き", "gen": gen})[0]
         self.assertEqual(post, 409)
 
     def test_bind_failure_is_fatal(self):
@@ -384,6 +391,31 @@ class ServerTests(unittest.TestCase):
                                            invite=None, agent="claude", tools=None, model=None, workdir=None,
                                            policy=None, guard="auto", max_rewrites=2, check_model=None,
                                            panel_port=0, confirm=False, timeout=900, max_replies=0))
+
+    def test_wildcard_bind_does_not_double_bind(self):
+        # 0.0.0.0 を指定したときは、127.0.0.1 を重ねて待ち受けない（重ねると起動できない）
+        import contextlib
+        with contextlib.closing(socket.socket()) as probe:
+            probe.bind(("127.0.0.1", 0))
+            port = probe.getsockname()[1]
+        srvs = []
+        real = cr.serve
+
+        def spy(room, key, invites, binds, port, **kw):
+            srvs.append(list(binds))
+            raise SystemExit("stop")                                 # 待ち受けの直前で止める
+        cr.serve = spy
+        try:
+            with self.assertRaises(SystemExit):
+                cr.cmd_host(argparse.Namespace(name="alice", room="w", bind=["0.0.0.0"], port=port, max_turns=0,
+                                               public=False, public_port=443, no_claude=True, new_key=False,
+                                               fresh=False, invite=None, agent="claude", tools=None, model=None,
+                                               workdir=None, policy=None, guard="auto", max_rewrites=2,
+                                               check_model=None, panel_port=0, confirm=False, timeout=900,
+                                               max_replies=0))
+        finally:
+            cr.serve = real
+        self.assertEqual(srvs, [["0.0.0.0"]])
 
     def test_browser_key_is_per_start_and_host_key_still_works(self):
         d = Path(tempfile.mkdtemp(dir=_TMP))
@@ -410,8 +442,14 @@ class ServerTests(unittest.TestCase):
         self.assertNotEqual(g1, g2)
         old = call(self.base, "/api/send", self.bob, {"name": "claude-bob", "kind": "claude", "text": "古い", "gen": g1})[0]
         self.assertEqual(old, 409)                                # 古い世代の投稿は通らない
+        for bad in (None, "x", True, 1.5):                        # 世代番号を省いたり壊したりしても、通らない
+            code = call(self.base, "/api/send", self.bob, {"name": "claude-bob", "kind": "claude", "text": "古い", "gen": bad})[0]
+            self.assertEqual(code, 400, repr(bad))
+            self.assertEqual(call(self.base, "/api/floor", self.bob, {"name": "claude-bob", "action": "release", "gen": bad})[0], 400)
+        self.room.agents["claude-bob"]["status"] = "thinking"
         call(self.base, "/api/floor", self.bob, {"name": "claude-bob", "action": "release", "gen": g1})
         self.assertIsNotNone(self.room.floor)                     # 古い世代の解放は、新しい発言権を外さない
+        self.assertEqual(self.room.agents["claude-bob"]["status"], "thinking")   # 表示の状態も変えない
         new = call(self.base, "/api/send", self.bob, {"name": "claude-bob", "kind": "claude", "text": "新しい", "gen": g2})[0]
         self.assertEqual(new, 200)
 
@@ -488,8 +526,8 @@ class ServerTests(unittest.TestCase):
         c = call(self.base, "/api/send", self.bob, {"name": "bob", "text": "changed", "cid": "same"})
         self.assertEqual(c[0], 409)                               # 同じ人の同じ ID で、中身が違う
         self.join(self.bob, "bob")
-        call(self.base, "/api/floor", self.bob, {"name": "claude-bob", "action": "claim"})
-        d = call(self.base, "/api/send", self.bob, {"name": "claude-bob", "kind": "claude", "text": "ai", "cid": "same"})
+        g = self.claim(self.bob, "claude-bob")
+        d = call(self.base, "/api/send", self.bob, {"name": "claude-bob", "kind": "claude", "text": "ai", "cid": "same", "gen": g})
         self.assertEqual(d[0], 200)                               # 同じ招待でも、AI の名前なら別の ID の扱い
 
     def test_pagination_does_not_drop(self):
@@ -900,6 +938,16 @@ class MaliciousHostTests(unittest.TestCase):
                             self.wfile.write(f"X-Slow-{i}: a\r\n".encode())
                             self.wfile.flush()
                             time.sleep(0.3)
+                    elif mode == "401chunked":
+                        self.send_response(401)
+                        self.send_header("Transfer-Encoding", "chunked")
+                        self.end_headers()
+                        self.wfile.write(b"2\r\n{}\r\n0\r\n")
+                        self.wfile.flush()
+                        for _ in range(100):                          # 終端のあとのトレーラーを少しずつ
+                            self.wfile.write(b"X")
+                            self.wfile.flush()
+                            time.sleep(0.3)
                     elif mode == "401":
                         self.send_response(401)
                         self.send_header("Content-Length", "100000")
@@ -929,15 +977,29 @@ class MaliciousHostTests(unittest.TestCase):
         old = cr.READ_GRACE
         cr.READ_GRACE = 1
         try:
-            for mode in ("headers", "401", "chunked"):
+            for mode in ("headers", "401", "chunked", "401chunked"):
                 ag = object.__new__(cr.Agent)
                 ag.base, ag.key = self._drip_server(mode), "k"
                 t = time.time()
                 with self.assertRaises((ValueError, cr.Kicked, OSError)):
                     ag.api("GET", "/x", timeout=1)
-                self.assertLess(time.time() - t, 10, mode)        # どの形でも、締め切りで戻る
+                self.assertLess(time.time() - t, 6, mode)         # どの形でも、締め切り（1 + 1 秒）のすぐあとに戻る
+            time.sleep(2)
+            leftover = [t for t in threading.enumerate() if t.name == "claude-room-fetch"]
+            self.assertEqual(leftover, [])                        # 通信のスレッドが残り続けない
+            self.assertEqual(cr._INFLIGHT[0], 0)
         finally:
             cr.READ_GRACE = old
+
+    def test_bracket_scan_is_linear(self):
+        for n in (8000, 32000, 128000):
+            data = b'"' + b'\\"' * n                               # 閉じていない文字列（正規表現では時間が二乗に増えた）
+            t = time.time()
+            with self.assertRaises(ValueError):
+                cr.parse_json(data)
+            self.assertLess(time.time() - t, 0.5, n)
+        big = json.dumps({"text": "a" * 2_000_000}).encode()       # 長い 1 つの文字列でも、余計なメモリを使わない
+        self.assertEqual(len(cr.parse_json(big)["text"]), 2_000_000)
 
     def test_many_objects_rejected(self):
         with self.assertRaises(ValueError):
@@ -1068,8 +1130,8 @@ class SecretCheckTests(unittest.TestCase):
 
         def fake_run_process(cmd, prompt, env=None):
             calls.append(cmd)
-            is_check = any("検査役" in open(cmd[cmd.index("--append-system-prompt-file") + 1], encoding="utf-8").read()
-                           for _ in [0])
+            with open(cmd[cmd.index("--append-system-prompt-file") + 1], encoding="utf-8") as f:
+                is_check = "検査役" in f.read()
             body = ('{"leak": true, "reasons": ["x"], "quotes": [], "hint": ""}' if is_check else "下書き")
             return json.dumps({"result": body, "session_id": "s"}), "", 0
         ag._run_process = fake_run_process

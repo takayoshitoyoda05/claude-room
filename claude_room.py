@@ -2,7 +2,7 @@
 """Claude Room — 自分の AI と相手の AI（Claude Code / Codex）を 1 つの部屋で会話させる。
 
   ホスト:   claude-room host --name alice
-  参加者:   claude-room join "<招待URL>" --name bob
+  参加者:   claude-room join            （起動後に招待URLを貼る）
 
 
 ブラウザで招待 URL を開くと、会話をリアルタイムに見られ、人間も発言できる。
@@ -15,6 +15,8 @@ import collections
 import getpass
 import hashlib
 import hmac
+import io
+import http.client
 import ipaddress
 import json
 import os
@@ -22,6 +24,7 @@ import re
 import secrets
 import shutil
 import socket
+import ssl
 import subprocess
 import tempfile
 import sys
@@ -402,10 +405,14 @@ class Room:
             return ok, self.state()
 
     def release(self, name, check=None, gen=None):
+        """発言権を手放す。世代が合わないとき（取り直されたあとの古い要求）は、何も変えない。"""
         with self.cond:
             if check is not None and not check():
                 raise Denied(401, "この招待は取り消されました")
-            if self.floor and self.floor[0] == name and (gen is None or self.floor[2] == gen):
+            held = bool(self.floor and self.floor[0] == name)
+            if held and gen is not None and self.floor[2] != gen:
+                return
+            if held:
                 self.floor = None
                 self._bump()
             if name in self.agents and self.agents[name]["status"] != "idle":
@@ -939,9 +946,10 @@ def make_handler(room, key, invites, trust_forwarded=False, browser_key=None):
                     return self._json(429, {"error": "投稿が多すぎます。少し待ってください"})
                 cid = str(d.get("cid") or "")[:64] or None
                 gen = d.get("gen")
+                if kind in AI_KINDS and type(gen) is not int:
+                    return self._json(400, {"error": "AI の投稿には、発言権の世代番号（gen）が必要です"})
                 return self._json(200, room.post(name, kind, text[:MAX_TEXT], cid=cid, check=self._check(),
-                                                 who=self.who.get("id", "host"),
-                                                 gen=gen if type(gen) is int else None))
+                                                 who=self.who.get("id", "host"), gen=gen))
             if path == "/api/control":
                 if not self.server.rate_ok(self.who.get("id", "host")):
                     return self._json(429, {"error": "操作が多すぎます。少し待ってください"})
@@ -957,7 +965,9 @@ def make_handler(room, key, invites, trust_forwarded=False, browser_key=None):
                     ok, st = room.claim(name, check=self._check(), gen=gen if type(gen) is int else None)
                     return self._json(200, {"ok": ok, "state": st})
                 gen = d.get("gen")
-                room.release(name, check=self._check(), gen=gen if type(gen) is int else None)
+                if type(gen) is not int:
+                    return self._json(400, {"error": "発言権を手放すには、世代番号（gen）が必要です"})
+                room.release(name, check=self._check(), gen=gen)
                 return self._json(200, {"ok": True})
             if path == "/api/status":
                 status = str(d.get("status") or "idle")
@@ -1775,10 +1785,11 @@ class Agent:
             if turn is not None:
                 self._record(turn)             # 発言権を手放す前に記録する（手放すのに失敗しても記録は残る）
             gen, self._floor_gen = self._floor_gen, None
-            try:
-                self.api("POST", "/api/floor", {"name": self.me, "action": "release", "gen": gen})
-            except (OSError, ValueError):
-                pass                           # 手放せなくても、期限が来れば外れる
+            if gen is not None:
+                try:
+                    self.api("POST", "/api/floor", {"name": self.me, "action": "release", "gen": gen})
+                except (OSError, ValueError):
+                    pass                       # 手放せなくても、期限が来れば外れる
 
     def _post_reply(self, reply):
         """投稿する。通信が切れたら同じ ID で送り直す（二重には投稿されない）。"""
@@ -2035,8 +2046,8 @@ class Agent:
             # Job Object に入れられないと、AI の子孫のプロセスを確実に止められない。その状態では動かさない
             try:
                 p.kill()
-                p.communicate()
-            except OSError:
+                p.communicate(timeout=10)
+            except (OSError, subprocess.SubprocessError):
                 pass
             raise RuntimeError("Windows の Job Object を使えないため、AI を安全に止められません。中止します")
 
@@ -2228,14 +2239,20 @@ def _pid_alive(pid):
         k32 = ctypes.windll.kernel32
         k32.OpenProcess.argtypes = [wintypes.DWORD, wintypes.BOOL, wintypes.DWORD]
         k32.OpenProcess.restype = wintypes.HANDLE
+        k32.GetExitCodeProcess.argtypes = [wintypes.HANDLE, ctypes.POINTER(wintypes.DWORD)]
+        k32.GetExitCodeProcess.restype = wintypes.BOOL
+        k32.CloseHandle.argtypes = [wintypes.HANDLE]
+        k32.CloseHandle.restype = wintypes.BOOL
         h = k32.OpenProcess(0x1000, False, pid)        # PROCESS_QUERY_LIMITED_INFORMATION
         if not h:
             return False if k32.GetLastError() == 87 else None     # 87 = ERROR_INVALID_PARAMETER（そのプロセスはいない）
-        code = wintypes.DWORD()
-        k32.GetExitCodeProcess.argtypes = [wintypes.HANDLE, ctypes.POINTER(wintypes.DWORD)]
-        alive = bool(k32.GetExitCodeProcess(h, ctypes.byref(code))) and code.value == 259   # STILL_ACTIVE
-        k32.CloseHandle(h)
-        return alive
+        try:
+            code = wintypes.DWORD()
+            if not k32.GetExitCodeProcess(h, ctypes.byref(code)):
+                return None                                        # 分からないときは「いる」扱い（消さない）
+            return code.value == 259                               # STILL_ACTIVE
+        finally:
+            k32.CloseHandle(h)
     except Exception:  # noqa: BLE001
         return None
 
@@ -2331,8 +2348,9 @@ def cmd_host(a):
         room.invite_bases = [start_funnel(a.port, a.public_port)]
         public = room.invite_bases
     else:
-        binds = a.bind or [b for b in (tailscale_ip(),) if b]
-        if "127.0.0.1" not in binds:      # 管理用の 127.0.0.1 は必ず待ち受ける（別のプログラムに取られないように）
+        binds = [("127.0.0.1" if b in ("localhost", "::1") else b) for b in (a.bind or [b for b in (tailscale_ip(),) if b])]
+        # 管理用の 127.0.0.1 は必ず待ち受ける（別のプログラムに取られないように）。0.0.0.0 はすべてを含む
+        if "127.0.0.1" not in binds and "0.0.0.0" not in binds and "::" not in binds:
             binds.append("127.0.0.1")
         up = serve(room, key, invites, binds, a.port, browser_key=browser_key)
         public = [h for h in up if not h.startswith("127.")]
@@ -2370,18 +2388,6 @@ def cmd_host(a):
     Agent(f"http://{up[0]}:{a.port}", key, a.name, a).run()
 
 
-class _NoRedirect(urllib.request.HTTPRedirectHandler):
-    """転送（リダイレクト）に従わない。悪意のあるホストが、参加者の PC の中のサーバーなど別の場所へ、
-    鍵を付けたまま要求を送らせるのを防ぐ。"""
-
-    def redirect_request(self, req, fp, code, msg, headers, newurl):
-        return None          # None を返すと、転送の応答がそのまま HTTPError になる
-
-
-# 環境変数のプロキシを使わない（鍵と会話を、Tailscale や HTTPS の外のプロキシへ平文で渡さないように）
-_OPENER = urllib.request.build_opener(urllib.request.ProxyHandler({}), _NoRedirect)
-
-
 def read_json(resp, limit, deadline=None):
     """応答を最大 limit バイトだけ読み、JSON として返す。大きすぎたり壊れていたりしたら ValueError。
 
@@ -2404,7 +2410,27 @@ def read_json(resp, limit, deadline=None):
     return parse_json(b"".join(chunks))
 
 
-_JSON_STRING_RE = re.compile(rb'"(?:[^"\\]|\\.)*"')
+_JSON_TOKEN_RE = re.compile(rb'\\.|"|[\[{]')      # エスケープ・引用符・開き括弧を、前から順に 1 回ずつ見る
+
+
+def count_brackets(data, limit):
+    """文字列の外にある [ と { の数を数える（limit を超えたら、そこでやめる）。
+
+    入力の長さに比例した時間で動き、余計なメモリを使わない（正規表現で文字列を消す方法は、
+    閉じていない文字列で時間が二乗に増え、長い文字列で大きなメモリを使った）。
+    """
+    n, in_str = 0, False
+    for m in _JSON_TOKEN_RE.finditer(data):
+        c = m.group()[:1]
+        if c == b"\\":
+            continue
+        if c == b'"':
+            in_str = not in_str
+        elif not in_str:
+            n += 1
+            if n > limit:
+                return n
+    return n
 
 
 def parse_json(data, max_objects=MAX_JSON_OBJECTS):
@@ -2413,8 +2439,7 @@ def parse_json(data, max_objects=MAX_JSON_OBJECTS):
     オブジェクトの数を数えるのは、{} を大量に並べた小さな応答で、大量のメモリを使わせる攻撃を防ぐため。
     """
     # 文字列の中の [ { は数えない（発言の本文に括弧が多いだけで、履歴が読めなくならないように）
-    structural = _JSON_STRING_RE.sub(b"", data)
-    if structural.count(b"[") + structural.count(b"{") > MAX_JSON_BRACKETS:
+    if count_brackets(data, MAX_JSON_BRACKETS) > MAX_JSON_BRACKETS:
         raise ValueError("配列やオブジェクトが多すぎます")
     count = [0]
 
@@ -2429,29 +2454,99 @@ def parse_json(data, max_objects=MAX_JSON_OBJECTS):
         raise ValueError("JSON として読めないか、入れ子が深すぎるか、大きすぎます")
 
 
+_INFLIGHT = [0]
+_INFLIGHT_LOCK = threading.Lock()
+MAX_INFLIGHT = 8                 # 締め切りを過ぎても終わらない通信を、これ以上は抱えない
+_SSL_CONTEXT = ssl.create_default_context()
+
+
+def _shutdown_conn(conn):
+    """接続のソケットを閉じて、別のスレッドで止まっている読み書きを終わらせる。"""
+    try:
+        if conn.sock is not None:
+            conn.sock.shutdown(socket.SHUT_RDWR)
+    except Exception:  # noqa: BLE001
+        pass
+    try:
+        conn.close()
+    except Exception:  # noqa: BLE001
+        pass
+
+
 def fetch_json(req, timeout, limit):
-    """要求を送り、JSON の応答を受け取る。接続・ヘッダー・本文を含む通信全体に、締め切り（timeout + READ_GRACE）を置く。
+    """要求を送り、JSON の応答を受け取る。接続・ヘッダー・本文・エラーの応答を含む通信全体に、
+    締め切り（timeout + READ_GRACE）を置く。
 
     ソケットの timeout は 1 回の読み書きの制限で、ヘッダーや chunked の区切りを少しずつ送られると、
-    全体では長く待たされうる。そこで通信を別のスレッドで行い、締め切りを過ぎたら待つのをやめる
-    （そのスレッドは、ソケットの時間切れでいずれ終わる）。
+    全体では長く待たされうる。そこで通信を別のスレッドで行い、締め切りを過ぎたらソケットを閉じて、
+    そのスレッドも終わらせる（http.client を直接使うのは、接続した直後からソケットを握って
+    いつでも閉じられるようにするため。転送には従わず、環境変数のプロキシも使わない）。
+    終わらない通信が溜まらないよう、抱える数にも上限を置く。
     """
+    with _INFLIGHT_LOCK:
+        if _INFLIGHT[0] >= MAX_INFLIGHT:
+            raise ValueError("終わっていない通信が多すぎます（ホストの応答が遅すぎます）")
+        _INFLIGHT[0] += 1
+    u = urlparse(req.full_url)
+    if u.scheme == "https":
+        conn = http.client.HTTPSConnection(u.hostname, u.port or 443, timeout=min(timeout, 10), context=_SSL_CONTEXT)
+    elif u.scheme == "http":
+        conn = http.client.HTTPConnection(u.hostname, u.port or 80, timeout=min(timeout, 10))
+    else:
+        with _INFLIGHT_LOCK:
+            _INFLIGHT[0] -= 1
+        raise ValueError("URL は http:// か https:// で始まる必要があります")
+    path = u.path or "/"
+    if u.query:
+        path += "?" + u.query
     result, box = {}, threading.Event()
+    deadline = time.monotonic() + timeout + READ_GRACE
 
     def work():
+        resp = None
         try:
-            with _OPENER.open(req, timeout=min(timeout, 10)) as r:
-                result["value"] = read_json(r, limit, deadline=time.monotonic() + timeout + READ_GRACE)
+            conn.connect()
+            conn.request(req.get_method(), path, body=req.data, headers=dict(req.header_items()))
+            resp = conn.getresponse()
+            if resp.status >= 300:                   # エラーの応答も、同じ締め切りの中で読む（転送 3xx にも従わない）
+                err = urllib.error.HTTPError(req.full_url, resp.status, resp.reason, resp.headers, io.BytesIO())
+                try:
+                    err.room_msg = _http_error(resp, deadline)
+                finally:
+                    err.close()                      # 説明は取り出したので、本文の入れ物はすぐ閉じる
+                raise err
+            result["value"] = read_json(resp, limit, deadline=deadline)
         except BaseException as e:  # noqa: BLE001 — 例外は呼び出し元へ渡す
             result["error"] = e
         finally:
+            if resp is not None:
+                try:
+                    resp.close()
+                except Exception:  # noqa: BLE001
+                    pass
+            _shutdown_conn(conn)
+            with _INFLIGHT_LOCK:
+                _INFLIGHT[0] -= 1
             box.set()
-    threading.Thread(target=work, daemon=True).start()
-    if not box.wait(timeout + READ_GRACE):
+    threading.Thread(target=work, daemon=True, name="claude-room-fetch").start()
+    if not box.wait(max(0.0, deadline - time.monotonic())):
+        _shutdown_conn(conn)                          # 読み書きを止めて、スレッドを終わらせる
         raise ValueError("応答を受け取り終えるまでに時間がかかりすぎます")
     if "error" in result:
         raise result["error"]
     return result["value"]
+
+
+def _http_error(e, deadline=None):
+    """エラーの応答から説明を取り出す（大きさを限り、形も確かめる）。fetch_json の中で読んだものがあれば、それを使う。"""
+    if hasattr(e, "room_msg"):
+        return e.room_msg
+    try:
+        body = read_json(e, MAX_ERROR_BODY, deadline=deadline if deadline is not None else time.monotonic() + 5)
+        msg = body.get("error") if isinstance(body, dict) else None
+        return str(msg)[:300] if msg else getattr(e, "reason", str(e))
+    except (ValueError, OSError, http.client.HTTPException):
+        return getattr(e, "reason", str(e))
 
 
 def _get_json(url, key, data=None):
@@ -2459,16 +2554,6 @@ def _get_json(url, key, data=None):
                                  data=json.dumps(data).encode() if data is not None else None,
                                  headers={"Authorization": "Bearer " + key, "Content-Type": "application/json"})
     return fetch_json(req, 15, MAX_RESPONSE)
-
-
-def _http_error(e):
-    """エラーの応答から説明を取り出す（大きさを限り、形も確かめる）。"""
-    try:
-        body = read_json(e, MAX_ERROR_BODY, deadline=time.monotonic() + 5)
-        msg = body.get("error") if isinstance(body, dict) else None
-        return str(msg)[:300] if msg else str(e)
-    except (ValueError, OSError):
-        return str(e)
 
 
 def cmd_join(a):
@@ -2521,8 +2606,7 @@ def cmd_invite(a):
     try:
         secret = inst.read_text().strip()
         ch = secrets.token_hex(16)
-        with _OPENER.open(f"{base}/api/ping?challenge={ch}", timeout=10) as r:
-            proof = read_json(r, MAX_ERROR_BODY).get("proof")
+        proof = fetch_json(urllib.request.Request(f"{base}/api/ping?challenge={ch}"), 10, MAX_ERROR_BODY).get("proof")
         if not isinstance(proof, str) or not hmac.compare_digest(
                 proof, hmac.new(secret.encode(), ch.encode(), "sha256").hexdigest()):
             sys.exit(f"ポート {a.port} にいるのは、この PC で開いた部屋ではありません。鍵は送りませんでした")
