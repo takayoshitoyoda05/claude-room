@@ -73,6 +73,12 @@ class NameTests(unittest.TestCase):
         self.assertEqual(cr.guest_names("bob"), {"bob", "claude-bob", "codex-bob"})
 
 
+class CleanTextTests(unittest.TestCase):
+    def test_control_characters_are_escaped(self):
+        self.assertEqual(cr.clean_text("ok\x1b[2J\x1b[H\x07"), "ok\\x1b[2J\\x1b[H\\x07")
+        self.assertEqual(cr.clean_text("改行\nタブ\t"), "改行\nタブ\t")
+
+
 class StopWordTests(unittest.TestCase):
     def test_word_hit(self):
         cases = [("6万", "6 万円まで", True), ("6万", "６万円", True), ("6万", "6 万 5 千円", False),
@@ -522,6 +528,44 @@ class ServerTests(unittest.TestCase):
         self.assertEqual(call(self.base, "/api/invites", None, {"name": "dave"}, headers=stale)[0], 401)   # 古い署名
         self.assertEqual(call(self.base, "/api/invites", self.bob, {"name": "x"})[0], 403)                 # 招待の鍵では不可
 
+    def test_signed_get_with_body_is_rejected_without_reading(self):
+        # 署名つきの GET に本文を付けて、送らずに待たせる手口。本文を読まずにすぐ断る
+        s = socket.create_connection(("127.0.0.1", self.srv.server_address[1]), timeout=10)
+        ts, nonce = str(int(time.time())), os.urandom(16).hex()
+        s.sendall((f"GET /api/invites HTTP/1.1\r\nHost: x\r\nX-Admin-Ts: {ts}\r\nX-Admin-Nonce: {nonce}\r\n"
+                   f"X-Admin-Sig: {'0' * 64}\r\nContent-Length: 80000\r\n\r\n").encode())
+        t = time.time()
+        head = s.recv(64)
+        s.close()
+        self.assertLess(time.time() - t, 3)
+        self.assertIn(b"401", head)
+
+    def test_admin_response_is_signed(self):
+        secret = self.room.instance
+        body = json.dumps({"name": "frank"}).encode()
+        ts, nonce = str(int(time.time())), os.urandom(16).hex()
+        h = {"X-Admin-Ts": ts, "X-Admin-Nonce": nonce, "X-Admin-Sig": cr.admin_signature(secret, "POST", "/api/invites", ts, nonce, body)}
+        req = urllib.request.Request(self.base + "/api/invites", data=body, method="POST",
+                                     headers=dict(h, **{"Content-Type": "application/json"}))
+        with urllib.request.urlopen(req, timeout=10) as r:
+            raw = r.read()
+            sig = r.headers.get("X-Admin-Resp-Sig")
+        self.assertEqual(sig, cr.admin_response_signature(secret, nonce, 200, raw))
+        self.assertIsNone(urllib.request.urlopen(self.base + "/api/ping").headers.get("X-Admin-Resp-Sig"))
+
+    def test_invite_cli_rejects_unsigned_response(self):
+        # 部屋を閉じたあとに同じポートを取った別のプログラムが、偽の「取り消しました」を返しても信じない
+        host = FakeHost({"/api/invites/revoke": {"invite": {"name": "bob"}}})
+        port = int(host.base.rsplit(":", 1)[1])
+        (cr.DATA_DIR / "instances").mkdir(exist_ok=True)
+        (cr.DATA_DIR / "instances" / str(port)).write_text("secret-of-real-room")
+        try:
+            with self.assertRaises(SystemExit) as cm:
+                cr.cmd_invite(argparse.Namespace(port=port, revoke="bob", list=False, name=None))
+            self.assertIn("この PC で開いた部屋のものではありません", str(cm.exception))
+        finally:
+            host.close()
+
     def test_control_is_all_or_nothing(self):
         before = len(self.room.messages)
         code = call(self.base, "/api/control", self.bob, {"by": "bob", "paused": True, "max_turns": "invalid"})[0]
@@ -650,6 +694,39 @@ class ServerTests(unittest.TestCase):
         self.assertNotIn("Python", urllib.request.urlopen(self.base + "/").headers["Server"])
 
 
+class HostProcessTests(unittest.TestCase):
+    def _args(self, port, room="lockroom"):
+        return argparse.Namespace(name="alice", room=room, bind=["127.0.0.1"], port=port, max_turns=0, public=False,
+                                  public_port=443, no_claude=True, new_key=False, fresh=False, invite=None,
+                                  agent="claude", tools=None, model=None, workdir=None, policy=None, guard="auto",
+                                  max_rewrites=2, check_model=None, panel_port=0, confirm=False, timeout=900,
+                                  max_replies=0)
+
+    def test_same_room_cannot_start_twice(self):
+        room_dir, _, _ = cr.room_paths("lockroom")
+        cr._lock_room(room_dir)                                     # 1 つ目のプロセスのつもりでロックを持つ
+        try:
+            with self.assertRaises(SystemExit) as cm:
+                cr.cmd_host(self._args(0))
+            self.assertIn("すでに別のプロセスで開いています", str(cm.exception))
+        finally:
+            f = cr._ROOM_LOCKS.pop()
+            f.close()
+
+    def test_failed_start_keeps_instance_secret(self):
+        # 使われているポートで 2 つ目を起動して失敗しても、動いている部屋の invite 用の秘密は壊れない
+        import contextlib
+        with contextlib.closing(socket.socket()) as taken:
+            taken.bind(("127.0.0.1", 0))
+            taken.listen(1)
+            port = taken.getsockname()[1]
+            inst = cr._ensure_dir(cr.DATA_DIR / "instances") / str(port)
+            inst.write_text("running-room-secret")
+            with self.assertRaises(SystemExit):
+                cr.cmd_host(self._args(port, room="otherroom"))
+        self.assertEqual(inst.read_text(), "running-room-secret")
+
+
 class StorageTests(unittest.TestCase):
     def test_rooms_do_not_collide(self):
         a = cr.room_paths("private")[1]
@@ -756,6 +833,11 @@ class FakeHost:
         class H(BaseHTTPRequestHandler):
             def log_message(self, *a):
                 pass
+
+            def do_POST(self):
+                n = int(self.headers.get("Content-Length") or 0)
+                self.rfile.read(n)
+                self.do_GET()
 
             def do_GET(self):
                 route = routes_.get(self.path.split("?")[0], {})

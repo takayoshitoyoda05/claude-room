@@ -143,8 +143,16 @@ if hasattr(sys.stdout, "reconfigure"):
         sys.stdout.reconfigure(encoding="utf-8", errors="replace")
 
 
+_CTRL_RE = re.compile(r"[\x00-\x08\x0b-\x1f\x7f]")
+
+
+def clean_text(text):
+    """端末に出す前に、制御文字（画面を消す ESC など）を見える形に置き換える。相手やホストから来た文字列用。"""
+    return _CTRL_RE.sub(lambda m: f"\\x{ord(m.group()):02x}", str(text))
+
+
 def log(*a):
-    print(time.strftime("%H:%M:%S"), *a, flush=True)
+    print(time.strftime("%H:%M:%S"), *(clean_text(x) for x in a), flush=True)
 
 
 # ---------------------------------------------------------------- server
@@ -603,6 +611,12 @@ def _security_headers(handler, nonce):
     handler.send_header("Referrer-Policy", "no-referrer")
 
 
+def admin_response_signature(secret, nonce, status, body):
+    """管理の応答の署名。要求の 1 回限りの番号と結びつけるので、別の応答を使い回せない。"""
+    msg = "\n".join(["resp", nonce, str(status), hashlib.sha256(body).hexdigest()]).encode()
+    return hmac.new(secret.encode(), msg, "sha256").hexdigest()
+
+
 def admin_signature(secret, method, path, ts, nonce, body):
     msg = "\n".join([method, path, str(ts), nonce, hashlib.sha256(body).hexdigest()]).encode()
     return hmac.new(secret.encode(), msg, "sha256").hexdigest()
@@ -708,6 +722,9 @@ def make_handler(room, key, invites, trust_forwarded=False, browser_key=None):
             self.send_header("Content-Type", ctype)
             self.send_header("Content-Length", str(len(body)))
             self.send_header("Cache-Control", "no-store")
+            if getattr(self, "_admin_nonce", None):     # 署名つきの要求への応答は、部屋の秘密で応答にも署名する
+                self.send_header("X-Admin-Resp-Sig", admin_response_signature(room.instance, self._admin_nonce,
+                                                                              code, body))
             if nonce:
                 _security_headers(self, nonce)
             self.end_headers()
@@ -752,10 +769,13 @@ def make_handler(room, key, invites, trust_forwarded=False, browser_key=None):
                 if abs(time.time() - int(ts)) > 60 or not re.fullmatch(r"[0-9a-f]{32}", nonce):
                     return False
                 n = int(self.headers.get("Content-Length") or 0)
-                if n < 0 or n > 4 * MAX_TEXT:
+                if self.headers.get("Transfer-Encoding") or n < 0 or n > 4 * MAX_TEXT:
                     return False
-                body = self.rfile.read(n)
+                if self.command != "POST" and n:
+                    return False               # GET に本文は付けさせない（受け取りの途中で待たせる手口への備え）
+                body = self.rfile.read(n) if n else b""
                 self._signed_body = body
+                self._admin_nonce = nonce
                 expect = admin_signature(room.instance, self.command, self.path, ts, nonce, body)
                 if not hmac.compare_digest(sig, expect):
                     return False
@@ -2266,6 +2286,27 @@ def toml_string(text):
     return '"' + "".join(out) + '"'
 
 
+_ROOM_LOCKS = []
+
+
+def _lock_room(room_dir):
+    """部屋のフォルダに、プロセスが終わるまで持ち続けるロックをかける。すでにかかっていれば起動しない。"""
+    path = room_dir / "lock"
+    f = open(path, "a+")
+    try:
+        if os.name == "posix":
+            import fcntl
+            fcntl.flock(f.fileno(), fcntl.LOCK_EX | fcntl.LOCK_NB)
+        else:
+            import msvcrt
+            f.seek(0)
+            msvcrt.locking(f.fileno(), msvcrt.LK_NBLCK, 1)
+    except OSError:
+        f.close()
+        sys.exit(f"この部屋（{room_dir.name}）は、すでに別のプロセスで開いています。先に閉じるか、別の --room を使ってください")
+    _ROOM_LOCKS.append(f)        # 閉じないで持ち続ける（プロセスの終了で外れる）
+
+
 def _cleanup_stale(root):
     """強制終了などで残った、持ち主のプロセスがもういない Codex の設定フォルダを消す。"""
     for d in root.iterdir():
@@ -2379,7 +2420,8 @@ def cmd_host(a):
     # ブラウザには、永続のホストの鍵ではなく、起動のたびに変わる鍵を渡す。部屋を閉じたあとにタブが残って
     # 再接続し続けても、別のプログラムに渡るのは、もう使えない鍵だけになる
     browser_key = secrets.token_urlsafe(24)
-    _, log_path, inv_path = room_paths(a.room)                  # 部屋ごとのフォルダ（ほかの部屋とぶつからない）
+    room_dir, log_path, inv_path = room_paths(a.room)           # 部屋ごとのフォルダ（ほかの部屋とぶつからない）
+    _lock_room(room_dir)                                         # 同じ部屋を 2 つ同時に開かない（招待の取り消しが食い違う）
     if a.fresh:
         stamp = time.strftime("%Y%m%d-%H%M%S")
         for p in (log_path, old_path(log_path)):
@@ -2390,10 +2432,6 @@ def cmd_host(a):
                  "（先頭に . と - は使えず、claude- と codex- で始まる名前も使えません）")
     room = Room(a.room, log_path, a.max_turns)
     room.host_name = a.name
-    inst = _ensure_dir(DATA_DIR / "instances") / str(a.port)
-    fd = os.open(str(inst), os.O_WRONLY | os.O_CREAT | os.O_TRUNC, 0o600)
-    with os.fdopen(fd, "w") as f:
-        f.write(room.instance)
     invites = Invites(inv_path)                                # 招待は部屋ごと
     invites.reserved = {a.name}                                # ホストの名前は、どの経路でも招待に使えない
     if a.public:
@@ -2412,6 +2450,15 @@ def cmd_host(a):
         reach = [h for h in public if h not in ("0.0.0.0", "::")]
         if any(h in ("0.0.0.0", "::") for h in public):
             reach += [h for h in (tailscale_ip(),) if h and h not in reach]
+            if not reach:
+                log("[注意] 招待に使うアドレスが分かりません（Tailscale のアドレスが取れません）。"
+                    "相手に届くアドレスを --bind で指定してください")
+    # 待ち受けに成功してから、invite コマンド用の秘密を書く（起動に失敗した 2 つ目が、動いている部屋の秘密を
+    # 上書きしてしまわないように）
+    inst = _ensure_dir(DATA_DIR / "instances") / str(a.port)
+    fd = os.open(str(inst), os.O_WRONLY | os.O_CREAT | os.O_TRUNC, 0o600)
+    with os.fdopen(fd, "w") as f:
+        f.write(room.instance)
         room.invite_bases = [f"http://{h}:{a.port}" for h in reach]
 
     print()
@@ -2447,6 +2494,10 @@ def cmd_host(a):
 
 
 def read_json(resp, limit, deadline=None):
+    return parse_json(read_bytes(resp, limit, deadline))
+
+
+def read_bytes(resp, limit, deadline=None):
     """応答を最大 limit バイトだけ読み、JSON として返す。大きすぎたり壊れていたりしたら ValueError。
 
     deadline（time.monotonic() の値）を過ぎたら、読むのをやめる。ソケットの timeout は 1 回の読み取りの
@@ -2465,7 +2516,7 @@ def read_json(resp, limit, deadline=None):
         size += len(chunk)
         if size > limit:
             raise ValueError("応答が大きすぎます")
-    return parse_json(b"".join(chunks))
+    return b"".join(chunks)
 
 
 _JSON_TOKEN_RE = re.compile(r'\\.|"|[\[{]')       # エスケープ・引用符・開き括弧を、前から順に 1 回ずつ見る
@@ -2544,7 +2595,7 @@ def _shutdown_conn(conn, sock=None):
         pass
 
 
-def fetch_json(req, timeout, limit):
+def fetch_json(req, timeout, limit, meta=None):
     """要求を送り、JSON の応答を受け取る。接続・ヘッダー・本文・エラーの応答を含む通信全体に、
     締め切り（timeout + READ_GRACE）を置く。
 
@@ -2590,7 +2641,10 @@ def fetch_json(req, timeout, limit):
                 finally:
                     err.close()                      # 説明は取り出したので、本文の入れ物はすぐ閉じる
                 raise err
-            result["value"] = read_json(resp, limit, deadline=deadline)
+            raw = read_bytes(resp, limit, deadline=deadline)
+            if meta is not None:
+                meta.update(status=resp.status, headers=dict(resp.getheaders()), raw=raw)
+            result["value"] = parse_json(raw)
         except BaseException as e:  # noqa: BLE001 — 例外は呼び出し元へ渡す
             result["error"] = e
         finally:
@@ -2620,7 +2674,7 @@ def _http_error(e, deadline=None):
     try:
         body = read_json(e, MAX_ERROR_BODY, deadline=deadline if deadline is not None else time.monotonic() + 5)
         msg = body.get("error") if isinstance(body, dict) else None
-        return str(msg)[:300] if msg else getattr(e, "reason", str(e))
+        return clean_text(str(msg)[:300]) if msg else clean_text(getattr(e, "reason", str(e)))
     except (ValueError, OSError, http.client.HTTPException):
         return getattr(e, "reason", str(e))
 
@@ -2679,7 +2733,14 @@ def _admin_json(base, secret, path, data=None):
     req = urllib.request.Request(base + path, method=method, data=body or None,
                                  headers={"Content-Type": "application/json", "X-Admin-Ts": ts, "X-Admin-Nonce": nonce,
                                           "X-Admin-Sig": admin_signature(secret, method, path, ts, nonce, body)})
-    return fetch_json(req, 15, MAX_RESPONSE)
+    meta = {}
+    value = fetch_json(req, 15, MAX_RESPONSE, meta=meta)
+    # 応答が本物の部屋から来たことを確かめる（部屋を閉じたあとにポートを取った別のプログラムが、
+    # 「取り消しました」などと偽の応答を返せないように）
+    expect = admin_response_signature(secret, nonce, meta.get("status", 0), meta.get("raw", b""))
+    if not hmac.compare_digest(meta.get("headers", {}).get("X-Admin-Resp-Sig", ""), expect):
+        sys.exit(f"ポート {base.rsplit(':', 1)[1]} の応答は、この PC で開いた部屋のものではありません。操作は行われていません")
+    return value
 
 
 def cmd_invite(a):
@@ -2848,7 +2909,7 @@ dialog pre{user-select:all}.btn.del{color:#c0392b}
     <span class="lbl">AI の連続発言</span><span class="meter" id="meter">0</span>
     <button class="btn stop" id="pause" title="すべての AI を止める（Esc）">■ 止める</button>
     <button class="btn" id="invite">招待</button>
-    <button class="btn" id="export" title="会話を Markdown で保存">保存</button>
+    <button class="btn" id="export" title="画面に残っている会話（最新 2000 件まで）を Markdown で保存">保存</button>
     <span class="conn" id="conn">●</span>
   </div>
 </header>
