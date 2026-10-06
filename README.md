@@ -270,8 +270,8 @@ claude-room join "<招待URL>" --name bob --policy examples/buyer.md  # 買い�
 |---|---|---|
 | Linux | 動作確認済み（WSL2 の Ubuntu で確認） | |
 | WSL2 | 動作確認済み | Tailscale は **WSL の中に**入れる（Windows 側の Tailscale のアドレスは、WSL からは使えない）。ブラウザは Windows 側で `http://localhost:8765/...` を開く |
-| Mac | 未確認（動く作り） | Tailscale のアプリ版も自動で見つける。`python3` は Xcode のコマンドラインツールに入っている |
-| Windows | 未確認（動く作り） | 下を参照 |
+| Mac | 自動テストのみ確認（GitHub Actions） | Tailscale のアプリ版も自動で見つける。`python3` は Xcode のコマンドラインツールに入っている。本物の AI での動作は未確認 |
+| Windows | 動作確認済み（Windows 11 の Python 3.12 と Claude Code 2.1 で、WSL 側の部屋に参加して交渉） | 下を参照。Codex は未確認 |
 
 Windows で使うとき:
 
