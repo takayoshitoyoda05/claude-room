@@ -358,6 +358,39 @@ class ServerTests(unittest.TestCase):
         call(self.base, "/api/control", self.key, {"by": "alice", "paused": True})
         self.assertIsNone(self.room.floor)                       # 全体を止めても外れる
 
+    def test_floor_generation_blocks_stale_renewal(self):
+        self.join(self.bob, "bob")
+        r = call(self.base, "/api/floor", self.bob, {"name": "claude-bob", "action": "claim"})[1]
+        gen = r["state"]["floor_gen"]
+        self.assertTrue(call(self.base, "/api/floor", self.bob, {"name": "claude-bob", "action": "claim", "gen": gen})[1]["ok"])
+        call(self.base, "/api/control", self.bob, {"by": "bob", "paused": True})       # 止めて
+        call(self.base, "/api/control", self.bob, {"by": "bob", "paused": False})      # すぐ再開
+        renew = call(self.base, "/api/floor", self.bob, {"name": "claude-bob", "action": "claim", "gen": gen})[1]
+        self.assertFalse(renew["ok"])                             # 古い世代の延長は通らない（下書きは捨てられる）
+        post = call(self.base, "/api/send", self.bob, {"name": "claude-bob", "kind": "claude", "text": "古い下書き"})[0]
+        self.assertEqual(post, 409)
+
+    def test_bind_failure_is_fatal(self):
+        port = self.srv.server_address[1]                         # すでに使われているポート
+        with self.assertRaises(SystemExit):
+            cr.serve(self.room, self.key, self.invites, ["127.0.0.1"], port)
+
+    def test_active_requests_per_guest(self):
+        for i in range(200):
+            self.room.post("alice", "human", "あ" * 10000)             # UTF-8 で約 6 MB の応答になる
+        socks, codes = [], []
+        for _ in range(cr.GUEST_ACTIVE + 2):
+            s = socket.create_connection(("127.0.0.1", self.srv.server_address[1]), timeout=10)
+            s.setsockopt(socket.SOL_SOCKET, socket.SO_RCVBUF, 4096)
+            s.sendall(f"GET /api/messages?tail=1 HTTP/1.1\r\nHost: x\r\nAuthorization: Bearer {self.bob}\r\n\r\n".encode())
+            socks.append(s)
+            time.sleep(0.2)                                       # 受け取らずに置いておく（送り手が詰まる）
+        for s in socks:
+            codes.append(s.recv(16))
+        self.assertGreaterEqual(sum(b"429" in c for c in codes), 1)   # 同時の要求は 1 人 8 個まで
+        for s in socks:
+            s.close()
+
     def test_streams_per_guest(self):
         codes = []
         socks = []
@@ -759,6 +792,42 @@ class MaliciousHostTests(unittest.TestCase):
             target.shutdown()
             target.server_close()
 
+    def test_array_bomb_rejected(self):
+        with self.assertRaises(ValueError):
+            cr.parse_json(b'{"messages": [' + b",".join([b"[]"] * (cr.MAX_JSON_BRACKETS + 5)) + b"]}")
+
+    def test_dripping_response_has_overall_deadline(self):
+        class Drip(BaseHTTPRequestHandler):
+            def log_message(self, *a):
+                pass
+
+            def do_GET(self):
+                self.send_response(200)
+                self.send_header("Content-Length", "100000")
+                self.end_headers()
+                try:
+                    for _ in range(1000):
+                        self.wfile.write(b" " * 100)
+                        self.wfile.flush()
+                        time.sleep(0.3)
+                except OSError:
+                    pass
+        srv = ThreadingHTTPServer(("127.0.0.1", 0), Drip)
+        threading.Thread(target=srv.serve_forever, daemon=True).start()
+        old = cr.READ_GRACE
+        cr.READ_GRACE = 1
+        try:
+            ag = object.__new__(cr.Agent)
+            ag.base, ag.key = f"http://127.0.0.1:{srv.server_address[1]}", "k"
+            t = time.time()
+            with self.assertRaises(ValueError):
+                ag.api("GET", "/x", timeout=1)
+            self.assertLess(time.time() - t, 8)                   # 少しずつ送られても、締め切りで戻る
+        finally:
+            cr.READ_GRACE = old
+            srv.shutdown()
+            srv.server_close()
+
     def test_many_objects_rejected(self):
         with self.assertRaises(ValueError):
             cr.parse_json(b'{"messages": [' + b",".join([b"{}"] * (cr.MAX_JSON_OBJECTS + 5)) + b"]}")
@@ -873,6 +942,27 @@ class SecretCheckTests(unittest.TestCase):
             self.assertFalse(v["ok"], bad)
             self.assertEqual(v["by"], "error", bad)
 
+    def test_max_replies_counts_generations(self):
+        ag = self._agent('{"leak": false}')
+        ag.guarded, ag.session, ag.owner, ag.product = False, "s", "alice", "claude"
+        ag.args = argparse.Namespace(check_model=None, model=None, confirm=False, guard="auto", max_rewrites=2,
+                                     max_replies=1)
+        ag.keep_floor, ag._floor_gen, ag._replies, ag.replied_upto, ag._fails = (lambda: True), 1, 0, 0, {}
+        ag.panel = argparse.Namespace(step=lambda *a, **k: None, set=lambda *a, **k: None,
+                                      new_turn=lambda talk: {"id": 1, "steps": []})
+        ag.history = [{"seq": 1, "ts": 0, "name": "bob", "kind": "human", "text": "@claude-alice こんにちは"}]
+        calls = []
+        ag.ask_ai = lambda prompt: calls.append(1) or "返事"
+        ag._halted_now = lambda: False
+        ag._addressed = lambda m: True
+        ag._post_reply = lambda reply: False                      # ホストが投稿を拒否し続ける
+        ag._record = lambda turn: None
+        st = {"paused": False, "max_turns": 0, "auto_turns": 0, "agents": [], "version": 1, "room": "r", "floor_gen": None}
+        ag.api = lambda *a, **k: {"ok": True, "state": st, "messages": []}
+        for _ in range(4):
+            ag.maybe_reply(st)
+        self.assertEqual(len(calls), 1)                            # 投稿できなくても、生成は 1 回で止まる
+
     def test_pass_on_direct_mention_is_rechecked(self):
         ag = self._agent('{"leak": false}')
         ag.guarded, ag.session, ag.owner = False, "s", "alice"
@@ -943,6 +1033,23 @@ class SessionCleanupTests(unittest.TestCase):
             else:
                 os.environ["CLAUDE_CONFIG_DIR"] = old
         self.assertEqual([p.name for p in proj.iterdir()], [f"{other}.jsonl"])   # 自分の会話だけが消える
+
+
+class SessionIdTests(unittest.TestCase):
+    def test_session_id_is_registered_before_run(self):
+        ag = object.__new__(cr.Agent)
+        ag.product, ag.bin, ag._sessions = "claude", "claude", set()
+        ag.args = argparse.Namespace(tools="")
+        seen = {}
+
+        def fake_run(cmd, prompt, env=None):
+            seen["cmd"] = cmd
+            raise cr.Stopped()                                     # 途中で止められた
+        ag._run_process = fake_run
+        with self.assertRaises(cr.Stopped):
+            ag._run_ai("p", "system")
+        sid = seen["cmd"][seen["cmd"].index("--session-id") + 1]
+        self.assertIn(sid, ag._sessions)                           # 止められても、消す対象に入っている
 
 
 class ProcessTests(unittest.TestCase):
@@ -1082,7 +1189,7 @@ class PanelTests(unittest.TestCase):
         self.assertLessEqual(len(self.panel.turns), 500)
 
     def test_deep_json_body_is_400(self):
-        deep = b"[" * 50000 + b"]" * 50000
+        deep = b"[" * 30000 + b"]" * 30000                         # 本文の上限（80000 バイト）の中に収める
         req = urllib.request.Request(self.base + "/api/decide", data=deep, method="POST",
                                      headers={"X-Token": self.panel.token, "Content-Type": "application/json"})
         with self.assertRaises(urllib.error.HTTPError) as cm:

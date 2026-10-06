@@ -28,6 +28,7 @@ import sys
 import threading
 import time
 import unicodedata
+import uuid
 import urllib.error
 import urllib.request
 from http.server import BaseHTTPRequestHandler, ThreadingHTTPServer
@@ -63,6 +64,8 @@ POST_RATE = 30                                             # 1 人（招待）�
 MAX_LOG_BYTES = 50 * 1024 * 1024                           # ログがこの大きさを超えたら、古いログに切り替える
 MAX_RESPONSE = 16 * 1024 * 1024                            # 参加者が受け取るホストの応答の上限（バイト）
 MAX_JSON_OBJECTS = 20000                                   # 1 つの応答に含まれてよい JSON のオブジェクトの数
+MAX_JSON_BRACKETS = 200000                                 # 1 つの応答に含まれてよい [ と { の数（配列の爆弾への備え）
+READ_GRACE = 15                                            # 応答を受け取り終えるまでの、timeout に足す猶予（秒）
 HISTORY_CHARS = 20_000_000                                 # 参加者が覚えておく発言の本文の合計（文字数）
 PROMPT_CHARS = 60_000                                      # 1 回に AI へ渡す発言の合計（文字数）
 PROMPT_MSG_CHARS = 6_000                                   # 1 件の発言として AI へ渡す長さ
@@ -72,6 +75,7 @@ MAX_PAGES = 20                                             # 1 回にまとめ�
 PAGE_CHARS = 2_000_000                                     # 1 回に返す発言の本文の合計（文字数）の上限
 OPS_RATE = 120                                             # 1 人あたり、1 分に読み取り・発言権・状態の要求をできる回数
 ANON_RATE = 60                                             # 鍵なしの要求（画面の取得など）を、1 つの送信元が 1 分にできる回数
+GUEST_ACTIVE = 8                                           # 招待された人 1 人あたり、同時に処理する要求の数
 GUEST_STREAMS = 4                                          # 招待された人 1 人あたりの待ち受けの本数
 GUEST_STREAMS_TOTAL = 24                                   # 招待された人全体の待ち受けの本数（残りはホスト用）
 FLOOR_UNREACHABLE = 120                                    # 承認待ちで、発言権を確かめられないまま待つ上限（秒）
@@ -152,7 +156,8 @@ class Room:
         self.paused_by = None
         self.max_turns = max_turns  # 0 = 上限なし（既定）
         self.auto_turns = 0        # 人間の発言なしに Claude が続けて話した回数
-        self.floor = None          # [name, expires]  いま返答を作っている Claude
+        self.floor = None          # [name, expires, gen]  いま返答を作っている AI と、その取得の世代番号
+        self.floor_gen = 0         # 発言権を新しく取るたびに増える。延長は、同じ世代のときだけ
         self.agents = {}           # name -> {owner, status, seen}
         self.viewers = 0
         self.version = 0
@@ -209,6 +214,7 @@ class Room:
         return {
             "room": self.name, "version": self.version, "paused": self.paused,
             "max_turns": self.max_turns, "auto_turns": self.auto_turns, "floor": floor,
+            "floor_gen": self.floor[2] if floor else None,
             "agents": [{"name": n, "owner": a["owner"], "status": a["status"],
                         "muted": a["muted"], "online": now - a["seen"] < ONLINE_SECS}
                        for n, a in sorted(self.agents.items())],
@@ -366,21 +372,31 @@ class Room:
     def limit_hit(self):
         return bool(self.max_turns) and self.auto_turns >= self.max_turns
 
-    def claim(self, name, check=None):
+    def claim(self, name, check=None, gen=None):
+        """発言権を取る（gen=None）か、延ばす（gen=取ったときの世代番号）。
+
+        延長は、同じ世代の発言権をまだ持っているときだけ成功する。止められて発言権を失ったあとに
+        再開されても、延長は失敗する（止める前の下書きを、そのまま投稿させないため）。
+        """
         with self.cond:
             if check is not None and not check():
                 raise Denied(401, "この招待は取り消されました")
             now = time.time()
+            held = bool(self.floor and self.floor[0] == name and self.floor[1] > now)
+            if gen is not None:
+                ok = held and self.floor[2] == gen
+                if ok:
+                    self.floor[1] = now + FLOOR_LEASE
+                return ok, self.state()
             # 発言権を取れるのは、生存の合図で部屋に登録された AI だけ（使っていない名前で握り続けられないように）
             ok = name in self.agents and not self.paused and not self.limit_hit() \
                 and not self.agents[name]["muted"] \
                 and not (self.floor and self.floor[1] > now and self.floor[0] != name)
             if ok:
-                renew = bool(self.floor and self.floor[0] == name and self.floor[1] > now)
-                self.floor = [name, now + FLOOR_LEASE]
-                if not renew:                   # 延長だけなら、全員を起こさない
-                    self.agents[name]["status"] = "thinking"
-                    self._bump()
+                self.floor_gen += 1
+                self.floor = [name, now + FLOOR_LEASE, self.floor_gen]
+                self.agents[name]["status"] = "thinking"
+                self._bump()
             return ok, self.state()
 
     def release(self, name, check=None):
@@ -408,6 +424,7 @@ class HardenedServer(ThreadingHTTPServer):
         self._fails = {}             # 送信元 -> 鍵を間違えた時刻のリスト
         self._posts = {}             # (種類, 投稿した人) -> 時刻のリスト
         self._stream_by = {}         # 招待の ID か host -> 待ち受けの本数
+        self._active_by = {}         # 招待の ID か host -> 処理中の要求の数
         self._pruned = [0.0, 0.0]    # 表の掃除をした時刻（鍵の間違い・回数の記録）
         self._warned = 0.0
         threading.Thread(target=self._reaper, daemon=True).start()
@@ -468,6 +485,23 @@ class HardenedServer(ThreadingHTTPServer):
                     r.shutdown(socket.SHUT_RDWR)
                 except OSError:
                     pass
+
+    def begin_request(self, who):
+        """鍵の確認を通った要求を数える。招待された人は、同時に GUEST_ACTIVE 個まで（遅い受け取りで枠を独り占めできない）。"""
+        with self._lock:
+            n = self._active_by.get(who, 0)
+            if who != "host" and n >= GUEST_ACTIVE:
+                return False
+            self._active_by[who] = n + 1
+            return True
+
+    def end_request(self, who):
+        with self._lock:
+            n = self._active_by.get(who, 1) - 1
+            if n <= 0:
+                self._active_by.pop(who, None)
+            else:
+                self._active_by[who] = n
 
     def begin_stream(self, request, who="host"):
         """長く待つ要求（鍵の確認済み）を、制限時間の対象から外す。上限を超えたら False。
@@ -660,11 +694,11 @@ def make_handler(room, key, invites, trust_forwarded=False):
             got = got[7:] if got.startswith("Bearer ") else ""
             if got and secrets.compare_digest(got.encode(), key.encode()):
                 self.who = {"role": "host", "name": room.host_name}
-                return True
+                return self._count()
             inv = invites.find(got) if got else None
             if inv:
                 self.who = {"role": "guest", "name": inv["name"], "id": inv["id"]}
-                return True
+                return self._count()
             ip = self._source()
             if self.server.too_many_fails(ip):
                 self._json(429, {"error": "too many attempts"})
@@ -672,6 +706,18 @@ def make_handler(room, key, invites, trust_forwarded=False):
                 self.server.record_fail(ip)
                 self._json(401, {"error": "bad key"})
             return False
+
+        def _count(self):
+            if not self.server.begin_request(self._who_id()):
+                self._json(429, {"error": "同時の要求が多すぎます。少し待ってください"})
+                return False
+            self._counted = True
+            return True
+
+        def finish(self):
+            if getattr(self, "_counted", False):
+                self.server.end_request(self._who_id())
+            super().finish()
 
         def _source(self):
             """要求の本当の送信元。
@@ -893,7 +939,8 @@ def make_handler(room, key, invites, trust_forwarded=False):
                 return self._json(429, {"error": "要求が多すぎます。少し待ってください"})
             if path == "/api/floor":
                 if d.get("action") == "claim":
-                    ok, st = room.claim(name, check=self._check())
+                    gen = d.get("gen")
+                    ok, st = room.claim(name, check=self._check(), gen=gen if type(gen) is int else None)
                     return self._json(200, {"ok": ok, "state": st})
                 room.release(name, check=self._check())
                 return self._json(200, {"ok": True})
@@ -937,8 +984,10 @@ def serve(room, key, invites, binds, port, trust_forwarded=False):
         try:
             srv = HardenedServer((host, port), make_handler(room, key, invites, trust_forwarded))
         except OSError as e:
-            log(f"[警告] {host}:{port} で待ち受けできません: {e}")
-            continue
+            # 一部だけで待ち受けを続けない。127.0.0.1 を別のプログラムに取られたまま続けると、
+            # invite コマンドがそのプログラムにホストの鍵を渡してしまう
+            sys.exit(f"{host}:{port} で待ち受けできません: {e}\n"
+                     f"  （ほかのプログラムがポート {port} を使っています。止めるか、--port で別のポートを指定してください）")
         threading.Thread(target=srv.serve_forever, daemon=True).start()
         servers.append(host)
     if not servers:
@@ -1381,6 +1430,7 @@ class Agent:
         rec_dir = _ensure_dir(DATA_DIR / "records" / self.me)
         self.record_path = rec_dir / f"{time.strftime('%Y%m%d-%H%M%S')}-{secrets.token_hex(3)}.jsonl"
         self._record_warned = False
+        self._floor_gen = None
         self._sessions = set()
         atexit.register(self.forget_sessions)
         self._fails = {}
@@ -1455,7 +1505,7 @@ class Agent:
             headers={"Authorization": "Bearer " + self.key, "Content-Type": "application/json"})
         try:
             with _OPENER.open(req, timeout=timeout) as r:
-                return read_json(r, MAX_RESPONSE)
+                return read_json(r, MAX_RESPONSE, deadline=time.monotonic() + timeout + READ_GRACE)
         except urllib.error.HTTPError as e:
             if e.code in (401, 403):
                 msg = _http_error(e)
@@ -1493,8 +1543,10 @@ class Agent:
                   and isinstance(a.get("name"), str) and NAME_RE.fullmatch(a["name"])]
         room = st.get("room")
         version = st.get("version")
+        gen = st.get("floor_gen")
         return {"room": room if isinstance(room, str) and valid_human(room) else "room",
                 "version": version if type(version) is int else -1,
+                "floor_gen": gen if type(gen) is int else None,
                 "paused": st.get("paused") is True, "max_turns": num("max_turns"),
                 "auto_turns": num("auto_turns"), "agents": agents}
 
@@ -1613,8 +1665,11 @@ class Agent:
 
         延ばせたら True、発言権を失っていたら False、通信できなかったら None。
         """
+        if self._floor_gen is None:
+            return False
         try:
-            r = self.api("POST", "/api/floor", {"name": self.me, "action": "claim"}, timeout=8)
+            r = self.api("POST", "/api/floor", {"name": self.me, "action": "claim", "gen": self._floor_gen},
+                         timeout=5)
         except (OSError, ValueError):
             return None
         return isinstance(r, dict) and r.get("ok") is True
@@ -1645,16 +1700,18 @@ class Agent:
             return
         if self.args.max_replies and self._replies >= self.args.max_replies:
             if self._replies == self.args.max_replies:
-                log(f"返答の上限（--max-replies {self.args.max_replies}）に達したので、これ以上は返答しません")
+                log(f"AI を呼ぶ回数の上限（--max-replies {self.args.max_replies}）に達したので、これ以上は返答しません")
                 self._replies += 1
             return
         if not self._addressed(latest):
             self.replied_upto = latest["seq"]
             return
         r = self.api("POST", "/api/floor", {"name": self.me, "action": "claim"})
-        self.v = self._clean_state(r.get("state") if isinstance(r, dict) else None)["version"]
+        st = self._clean_state(r.get("state") if isinstance(r, dict) else None)
+        self.v = st["version"]
         if not (isinstance(r, dict) and r.get("ok") is True):
             return
+        self._floor_gen = st["floor_gen"]      # 取ったときの世代番号。延長はこの世代でだけ通る
         turn = None
         try:
             self._absorb(self.api("GET", f"/api/messages?after={self.history[-1]['seq']}"))
@@ -1665,6 +1722,7 @@ class Agent:
             upto = self.history[-1]["seq"]
             log(f"← {', '.join(sorted({m['name'] for m in talk}))} の発言 {len(talk)} 件に返答を作っています…")
             turn = self.panel.new_turn(talk)
+            self._replies += 1                  # AI を呼ぶ前に数える（投稿できなくても、費用はかかるため）
             try:
                 reply = self.compose(turn, talk)
             except Kicked:
@@ -1694,7 +1752,6 @@ class Agent:
                 return
             if self._post_reply(reply):
                 self.replied_upto = upto        # 投稿できたときだけ、返事済みにする
-                self._replies += 1
                 self.panel.set(turn, status="posted", final=reply)
                 log(f"→ 投稿しました（{len(reply)} 文字）")
             else:
@@ -1702,6 +1759,7 @@ class Agent:
         finally:
             if turn is not None:
                 self._record(turn)             # 発言権を手放す前に記録する（手放すのに失敗しても記録は残る）
+            self._floor_gen = None
             try:
                 self.api("POST", "/api/floor", {"name": self.me, "action": "release"})
             except (OSError, ValueError):
@@ -1895,6 +1953,11 @@ class Agent:
                 cmd += ["--model", model]
             if resume:
                 cmd += ["--resume", resume]
+            elif not checker:
+                # 会話の ID をこちらで決めて、始める前に「消す対象」に入れておく（途中で止まっても消せるように）
+                resume_new = str(uuid.uuid4())
+                self._sessions.add(resume_new)
+                cmd += ["--session-id", resume_new]
             stdout, stderr, _ = self._run_process(cmd, prompt)
         finally:
             _remove(path)
@@ -1907,7 +1970,10 @@ class Agent:
         cost = out.get("total_cost_usd")
         if isinstance(cost, (int, float)):
             log(f"   （費用の目安: ${cost:.4f}）")
-        return str(out.get("result") or "").strip(), out.get("session_id") or resume
+        sid = out.get("session_id") or resume
+        if isinstance(sid, str):
+            self._sessions.add(sid)
+        return str(out.get("result") or "").strip(), sid
 
     def _codex_config(self, system):
         """部屋専用の CODEX_HOME に、この 1 回分の設定を書く。部屋のルールは「開発者の指示」として渡す。"""
@@ -1945,6 +2011,7 @@ class Agent:
         p = subprocess.Popen(cmd, stdin=subprocess.PIPE, stdout=subprocess.PIPE, stderr=subprocess.PIPE,
                              text=True, encoding="utf-8", errors="replace", cwd=self.args.workdir,
                              start_new_session=posix, env=env)
+        job = None if posix else _WindowsJob.attach(p)
 
         def kill():
             # プロセスグループごと止める（AI が起こした孫のプロセスも残さない。直接の子が先に終わっていても）
@@ -1953,7 +2020,9 @@ class Agent:
                     os.killpg(p.pid, 9)
                 except OSError:
                     pass
-            elif p.poll() is None:      # Windows: 子と孫をまとめて止める
+            elif job is not None:
+                job.terminate()         # Windows: Job Object で、子と孫をまとめて止める
+            else:
                 try:
                     subprocess.run(["taskkill", "/T", "/F", "/PID", str(p.pid)], capture_output=True, timeout=10)
                 except (OSError, subprocess.SubprocessError):
@@ -2041,6 +2110,60 @@ def _private_file(text):
     return path
 
 
+class _WindowsJob:
+    """Windows の Job Object。AI のプロセスとその子孫をまとめて管理し、まとめて止める。
+
+    taskkill /T は、直接の子が先に終わっていると孫を見つけられない。Job Object なら、
+    最初に入れたプロセスが起こした子孫も自動的に同じ Job に入り、まとめて止められる。
+    """
+
+    def __init__(self, handle, k32):
+        self.handle, self.k32 = handle, k32
+
+    @classmethod
+    def attach(cls, p):
+        try:
+            import ctypes
+            from ctypes import wintypes
+            k32 = ctypes.windll.kernel32
+            job = k32.CreateJobObjectW(None, None)
+            if not job:
+                return None
+
+            class JOBOBJECT_BASIC_LIMIT_INFORMATION(ctypes.Structure):
+                _fields_ = [("PerProcessUserTimeLimit", ctypes.c_int64), ("PerJobUserTimeLimit", ctypes.c_int64),
+                            ("LimitFlags", wintypes.DWORD), ("MinimumWorkingSetSize", ctypes.c_size_t),
+                            ("MaximumWorkingSetSize", ctypes.c_size_t), ("ActiveProcessLimit", wintypes.DWORD),
+                            ("Affinity", ctypes.c_size_t), ("PriorityClass", wintypes.DWORD),
+                            ("SchedulingClass", wintypes.DWORD)]
+
+            class IO_COUNTERS(ctypes.Structure):
+                _fields_ = [(n, ctypes.c_uint64) for n in ("ReadOperationCount", "WriteOperationCount",
+                                                           "OtherOperationCount", "ReadTransferCount",
+                                                           "WriteTransferCount", "OtherTransferCount")]
+
+            class JOBOBJECT_EXTENDED_LIMIT_INFORMATION(ctypes.Structure):
+                _fields_ = [("BasicLimitInformation", JOBOBJECT_BASIC_LIMIT_INFORMATION), ("IoInfo", IO_COUNTERS),
+                            ("ProcessMemoryLimit", ctypes.c_size_t), ("JobMemoryLimit", ctypes.c_size_t),
+                            ("PeakProcessMemoryUsed", ctypes.c_size_t), ("PeakJobMemoryUsed", ctypes.c_size_t)]
+            info = JOBOBJECT_EXTENDED_LIMIT_INFORMATION()
+            info.BasicLimitInformation.LimitFlags = 0x2000     # JOB_OBJECT_LIMIT_KILL_ON_JOB_CLOSE
+            k32.SetInformationJobObject(job, 9, ctypes.byref(info), ctypes.sizeof(info))   # ExtendedLimitInformation
+            if not k32.AssignProcessToJobObject(job, wintypes.HANDLE(p._handle)):
+                k32.CloseHandle(job)
+                return None
+            return cls(job, k32)
+        except Exception:  # noqa: BLE001 — Job Object が使えない環境では、taskkill に戻る
+            return None
+
+    def terminate(self):
+        try:
+            self.k32.TerminateJobObject(self.handle, 1)
+            self.k32.CloseHandle(self.handle)
+        except Exception:  # noqa: BLE001
+            pass
+
+
 def _cleanup_stale(root):
     """強制終了などで残った、持ち主のプロセスがもういない Codex の設定フォルダを消す。"""
     for d in root.iterdir():
@@ -2105,16 +2228,16 @@ def add_agent_args(p):
     p.add_argument("--confirm", action="store_true", help="すべての投稿の前に、代理人パネルで確認する")
     p.add_argument("--timeout", type=int, default=900, help="1 回の返答の制限時間（秒）")
     p.add_argument("--max-replies", type=int, default=0,
-                   help="自分の AI が返答する回数の上限（既定 0＝上限なし。費用の上限として）")
+                   help="自分の AI が返答を作る回数の上限（投稿できなかった分も数える。既定 0＝上限なし。費用の目安として）")
 
 
 def print_invite(base, inv_key, name):
     url = f"{base}/#key={inv_key}"
     raw = REPO_URL.replace("github.com", "raw.githubusercontent.com") + "/main/claude_room.py"
     print(f"  {name} さんへの招待URL :  {url}")
-    print("    参加コマンド（どちらか。Codex で参加するなら、末尾に --agent codex）:")
-    print(f'      uvx --from git+{REPO_URL} claude-room join "{url}"')
-    print(f'      curl -O {raw} && python3 claude_room.py join "{url}"')
+    print("    参加コマンド（どちらか。Codex で参加するなら、末尾に --agent codex。URL は起動後に聞かれたら貼る）:")
+    print(f"      uvx --from git+{REPO_URL} claude-room join")
+    print(f"      curl -O {raw} && python3 claude_room.py join")
 
 
 def _room_name(v):
@@ -2197,12 +2320,26 @@ class _NoRedirect(urllib.request.HTTPRedirectHandler):
 _OPENER = urllib.request.build_opener(urllib.request.ProxyHandler({}), _NoRedirect)
 
 
-def read_json(resp, limit):
-    """応答を最大 limit バイトだけ読み、JSON として返す。大きすぎたり壊れていたりしたら ValueError。"""
-    data = resp.read(limit + 1)
-    if len(data) > limit:
-        raise ValueError("応答が大きすぎます")
-    return parse_json(data)
+def read_json(resp, limit, deadline=None):
+    """応答を最大 limit バイトだけ読み、JSON として返す。大きすぎたり壊れていたりしたら ValueError。
+
+    deadline（time.monotonic() の値）を過ぎたら、読むのをやめる。ソケットの timeout は 1 回の読み取りの
+    制限なので、少しずつ送ってくる相手には効かない。通信全体の締め切りを別に持つ。
+    """
+    chunks, size = [], 0
+    while True:
+        if deadline is not None and time.monotonic() > deadline:
+            raise ValueError("応答を受け取り終えるまでに時間がかかりすぎます")
+        # read1 は「いま届いている分」だけを返す（read は指定した量がそろうまで待つので、少しずつ送られると
+        # 締め切りを確かめられない）
+        chunk = getattr(resp, "read1", resp.read)(min(65536, limit + 1 - size))
+        if not chunk:
+            break
+        chunks.append(chunk)
+        size += len(chunk)
+        if size > limit:
+            raise ValueError("応答が大きすぎます")
+    return parse_json(b"".join(chunks))
 
 
 def parse_json(data, max_objects=MAX_JSON_OBJECTS):
@@ -2210,6 +2347,8 @@ def parse_json(data, max_objects=MAX_JSON_OBJECTS):
 
     オブジェクトの数を数えるのは、{} を大量に並べた小さな応答で、大量のメモリを使わせる攻撃を防ぐため。
     """
+    if data.count(b"[") + data.count(b"{") > MAX_JSON_BRACKETS:
+        raise ValueError("配列やオブジェクトが多すぎます")
     count = [0]
 
     def hook(obj):
@@ -2228,7 +2367,7 @@ def _get_json(url, key, data=None):
                                  data=json.dumps(data).encode() if data is not None else None,
                                  headers={"Authorization": "Bearer " + key, "Content-Type": "application/json"})
     with _OPENER.open(req, timeout=15) as r:
-        return read_json(r, MAX_RESPONSE)
+        return read_json(r, MAX_RESPONSE, deadline=time.monotonic() + 15 + READ_GRACE)
 
 
 def _http_error(e):
@@ -2242,7 +2381,21 @@ def _http_error(e):
 
 
 def cmd_join(a):
-    u = urlparse(a.url)
+    url = a.url
+    if not url:
+        # 招待URLは鍵そのもの。コマンドの引数に書くと、同じ PC のほかの利用者からプロセスの一覧で見えることが
+        # あるので、聞いて受け取る（画面には出さない）。パイプからでも受け取れる
+        try:
+            url = (getpass.getpass("招待URLを貼ってください（表示されません）: ") if sys.stdin.isatty()
+                   else sys.stdin.readline()).strip()
+        except (EOFError, OSError):
+            url = ""
+        if not url:
+            sys.exit("招待URLが入力されませんでした")
+    elif sys.stdin.isatty():
+        log("[注意] 招待URLをコマンドの引数に書くと、同じ PC のほかの利用者に見えることがあります。"
+            "次からは、URL を付けずに claude-room join と打ち、聞かれたときに貼ってください")
+    u = urlparse(url)
     key = a.key or parse_qs(u.fragment).get("key", [""])[0] or parse_qs(u.query).get("key", [""])[0]
     if not key:
         sys.exit("URL に #key=... が含まれていません（招待URLをそのまま貼ってください）")
@@ -2334,7 +2487,7 @@ def main():
     h.set_defaults(func=cmd_host)
     h.add_argument("--invite", action="append", metavar="NAME", help="起動と同時に、この人への招待を作る（何回でも指定できる）")
     j = sub.add_parser("join", help="招待URLで部屋に入る")
-    j.add_argument("url")
+    j.add_argument("url", nargs="?", help="招待URL（省略すると、起動後に聞く。鍵が引数に残らないので、そのほうが安全）")
     j.add_argument("--key", help=argparse.SUPPRESS)
     add_agent_args(j)
     j.set_defaults(func=cmd_join, name=None)
@@ -2550,8 +2703,8 @@ $('#export').onclick=()=>{const md=`# Claude Room / ${state?state.room:''}\n\n`+
   const a=document.createElement('a');a.href=URL.createObjectURL(new Blob([md],{type:'text/markdown'}));a.download=`claude-room-${(state&&state.room)||'log'}.md`;a.click()};
 function inviteHtml(base,key,name){const u=`${base}/#key=${key}`,raw=REPO.replace('github.com','raw.githubusercontent.com')+'/main/claude_room.py';
   return `<p style="margin-bottom:4px"><b>${esc(name)} さんへの招待URL</b>（<b>いまだけ表示します</b>。コピーして、1 対 1 で渡してください）</p><pre>${esc(u)}</pre>
-  <p style="margin-bottom:4px">相手の AI を参加させる（相手の PC で。Python と、Claude Code か Codex が必要）:</p><pre>uvx --from git+${esc(REPO)} claude-room join "${esc(u)}"</pre>
-  <p style="font-size:13px;color:var(--mute);margin:4px 0">uv がない場合（Python だけで動きます）:</p><pre>curl -O ${esc(raw)}\npython3 claude_room.py join "${esc(u)}"</pre>
+  <p style="margin-bottom:4px">相手の AI を参加させる（相手の PC で。Python と、Claude Code か Codex が必要）:</p><pre>uvx --from git+${esc(REPO)} claude-room join</pre><p style="font-size:13px;color:var(--mute);margin:4px 0">起動すると招待URLを聞かれるので、上の URL を貼ります（引数に書かないのは、鍵が同じ PC のほかの利用者に見えないようにするため）。</p>
+  <p style="font-size:13px;color:var(--mute);margin:4px 0">uv がない場合（Python だけで動きます）:</p><pre>curl -O ${esc(raw)}\npython3 claude_room.py join</pre>
   <p style="font-size:12px;color:var(--mute)">Codex で参加するときは、末尾に <code>--agent codex</code> を付けます。どちらも GitHub の公開版を使い、ホストの PC からプログラムを受け取ることはありません。</p>`}
 async function loadInvites(){const r=await api('/api/invites');
   $('#invList').innerHTML=r.invites.length?r.invites.slice().reverse().map(i=>`<div class="invitem"><b class="${i.revoked?'gone':''}">${esc(i.name)}</b><span>${i.revoked?'取り消し済み':'有効'} ・ 作成 ${new Date(i.created*1000).toLocaleString('ja-JP')}</span>${i.revoked?'':`<button class="btn del" data-rv="${esc(i.id)}" data-nm="${esc(i.name)}">取り消す</button>`}</div>`).join(''):'<p style="color:var(--mute);font-size:13px">まだありません</p>';

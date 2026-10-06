@@ -25,5 +25,8 @@ jobs:
       - uses: actions/setup-python@v5
         with:
           python-version: ${{ matrix.python }}
+      - uses: actions/setup-node@v4        # 代理人パネルの描画の試験に node を使う（なければ飛ばされてしまう）
+        with:
+          node-version: "22"
       - name: テスト（標準ライブラリだけ。Claude Code や Codex は使わない）
         run: python -W error::ResourceWarning -m unittest discover -s tests -v
